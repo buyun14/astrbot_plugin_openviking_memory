@@ -12,7 +12,7 @@ Auto-captures conversations and performs semantic recall on every LLM request. B
 - **Peer profiles**: Incoming group messages carry a `peer_id` (the sender); on commit OV builds a per-person profile under `viking://user/<bot>/peers/<sender_id>/`. The bot's own replies and tool I/O stay "self".
 - **Structured tool calls**: Tool calls and results are recorded as standalone `tool` parts (`tool_name`/`tool_input`/`tool_status`), not folded into text, so the server can process them separately.
 - **Image transcription**: Optionally transcribe images to text via a vision provider (see [Image transcription](#image-transcription)).
-- **Auto-recall**: Before each LLM request, the plugin recalls self (bot/group context) + the current speaker + recently-active members and appends them to the system prompt.
+- **Auto-recall**: Before each LLM request, the plugin recalls self (bot/group context) + the current speaker + recently-active members and appends them as a provider-only content part at the **tail** of the current user message (never the system prompt, which would invalidate the provider's prefix cache for the whole history).
 - **Auto-commit**: Sessions are committed (archived + memory extracted) based on message count, token threshold, or idle timeout.
 - **Backfill**: On first encounter with a group, historical messages are pulled from the platform and ingested into OV.
 

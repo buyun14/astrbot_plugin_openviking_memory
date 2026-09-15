@@ -34,6 +34,7 @@ from .ov_client.identity import (
     safe_peer_id,
     venue_is_group,
 )
+from .ov_client.injection import inject_recall_block
 from .ov_client.parts import (
     assistant_text_part,
     build_message,
@@ -378,7 +379,7 @@ class OpenVikingMemoryPlugin(Star):
             **auth,
         )
         if block:
-            req.system_prompt = (req.system_prompt or "") + "\n\n" + block
+            inject_recall_block(req, block)
 
     # -- hook: capture LLM response -------------------------------------------
 
