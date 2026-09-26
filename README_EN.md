@@ -49,7 +49,13 @@ All fields are configured via AstrBot WebUI after installation.
 | `auto_recall_enabled` | `true` | Auto-recall on every LLM request |
 | `recall_limit` | `8` | Max recalled entries |
 | `recall_min_score` | `0.35` | Minimum semantic score |
-| `recall_token_budget` | `2000` | Max tokens for injected context |
+| `recall_token_budget` | `2000` | Max tokens for injected context (also sent as the context-mode `max_tokens` budget) |
+| `recall_context_enabled` | `true` | Use server-side context assembly (cross-turn dedup + query expansion + budgeting). Turn off to fall back to plain ranked search |
+| `recall_dedup_turns` | `3` | Do not re-inject a memory served within this many turns (context mode only); use `1` in busy group chats |
+| `recall_peer_scope` | `auto` | Which peers the context face may read: `auto` (`all` under `venue`, `actor` under `global`) / `actor` / `all`. ⚠️ `all` scans every peer of the OV user, so it is only safe when each venue has its own user |
+| `recall_query_expansion` | `true` | Let the server expand the query before searching (helps with abbreviations; adds latency) |
+| `recall_rewrite` | `false` | Ask for a rewritten digest instead of raw entries; noticeably slower, so raise `recall_timeout_ms` if enabled |
+| `recall_timeout_ms` | `12000` | Give up on a recall request after this long and inject nothing (ms) |
 | `commit_message_threshold` | `20` | Auto-commit after N messages |
 | `commit_token_threshold` | `4096` | Auto-commit when tokens exceed this |
 | `commit_idle_seconds` | `1800` | Auto-commit after N seconds idle (also the "recent" window for peer recall) |
@@ -77,7 +83,12 @@ The model is **one bot "self" + one "peer" per person**. `self_scope` controls t
 
 All peers live under the same bot-self space (`viking://user/<bot>/peers/*`). Recall by default pulls self + the current speaker + recently-active members, so when A asks something the bot can also recall B's and C's profiles (e.g. "what does Bob like?").
 
-> OpenViking does not allow searching *all* peers at once — each recalled person must be named explicitly, which `peer_recall_scope` controls. This is cleaner than the old fanout: each person's profile is stored once, with no lossy copying.
+How the peer set is selected depends on the tier in use:
+
+- **Context tier (default)**: the server resolves identity from the caller, so the plugin only passes `peer_scope`. Under `venue` scope the OV user *is* the group and `all` means "the people in this group"; under `global` the user is shared across groups, where `all` would reach other groups' peers, so it is forced down to `actor`. If the server rejects `peer_scope`, the plugin only ever narrows to `actor` (with a warning) — it never widens.
+- **Degraded tier (list / find)**: no server-side identity resolution, so peers must still be named explicitly as `target_uri`, with `peer_recall_scope` controlling the range.
+
+In other words `peer_recall_scope` only affects the degraded tier; the context tier reads `recall_peer_scope`.
 
 ## Image transcription
 

@@ -69,9 +69,39 @@
     "default": 0.35
   },
   "recall_token_budget": {
-    "description": "Max tokens for injected recall context",
+    "description": "Max tokens for injected recall context (also sent as the context-mode max_tokens budget)",
     "type": "int",
     "default": 2000
+  },
+  "recall_context_enabled": {
+    "description": "Use server-side context assembly (cross-turn dedup, query expansion, token budgeting). Turn off to fall back to plain ranked search",
+    "type": "bool",
+    "default": true
+  },
+  "recall_dedup_turns": {
+    "description": "Do not re-inject a memory that was already served within this many turns (context mode only). Use 1 in busy group chats",
+    "type": "int",
+    "default": 3
+  },
+  "recall_peer_scope": {
+    "description": "Whose peers the context face may read: auto (all under venue scope, actor otherwise) | actor | all. 'all' scans every peer of the OV user, so it is only safe when each venue has its own user",
+    "type": "string",
+    "default": "auto"
+  },
+  "recall_query_expansion": {
+    "description": "Let the server expand the query before searching (helps with abbreviations and one-word follow-ups, adds latency)",
+    "type": "bool",
+    "default": true
+  },
+  "recall_rewrite": {
+    "description": "Ask the server for a rewritten digest instead of raw entries. Noticeably slower; raise recall_timeout_ms if enabled",
+    "type": "bool",
+    "default": false
+  },
+  "recall_timeout_ms": {
+    "description": "Give up on a recall request after this long and inject nothing (ms)",
+    "type": "int",
+    "default": 12000
   },
   "commit_message_threshold": {
     "description": "Auto-commit after this many pending messages",

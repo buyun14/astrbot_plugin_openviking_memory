@@ -11,12 +11,17 @@ import hashlib
 import re
 from typing import Any
 
-from .client import OVClient
+from .client import ContextSearchUnsupported, OVClient
 from .config import PluginConfig
 from .identity import parse_venue_origin, safe_peer_id, venue_is_group
 from .parts import estimate_tokens
+from .recall_ledger import RecallLedger
 
 _PEER_URI_RE = re.compile(r"/peers/([^/]+)/")
+
+_BLOCK_OPEN = "<openviking-context>"
+_BLOCK_HINT = "Relevant context from OpenViking. Use the read MCP tool to expand URIs."
+_BLOCK_CLOSE = "</openviking-context>"
 
 _PREFERENCE_RE = re.compile(
     r"prefer|preference|favorite|favourite|like|偏好|喜欢|爱好|更倾向", re.I
@@ -151,6 +156,104 @@ def _build_recall_targets(
     return targets, peer_ids
 
 
+_MIN_QUERY_CHARS = 2
+_AT_PREFIX_RE = re.compile(r"^(?:@\S+\s*)+")
+_COMMAND_PREFIX_RE = re.compile(r"^/\S+\s*")
+
+
+def _clean_query(query: str) -> str:
+    """Strip leading @mentions and a command prefix; truncate very long input.
+
+    A message that is nothing but a mention or a command cleans down to nothing
+    and is not worth an embed call.
+    """
+    text = str(query or "").strip()
+    text = _AT_PREFIX_RE.sub("", text).strip()
+    text = _COMMAND_PREFIX_RE.sub("", text).strip()
+    return text[:4000]
+
+
+def _resolve_peer_scope(cfg: PluginConfig, ledger: RecallLedger | None, self_scope: str) -> str:
+    """Effective ``actor``/``all`` for this venue.
+
+    ``auto`` widens to ``all`` only under venue scope, where the OV user is the
+    group and ``all`` therefore means "the people in this group". Under global
+    scope every peer of the shared bot user would be scanned, so it stays
+    ``actor``.
+    """
+    requested = str(getattr(cfg, "recall_peer_scope", "auto") or "auto").lower()
+    if ledger is not None:
+        return ledger.resolve_peer_scope(requested, self_scope=self_scope)
+    if requested in ("actor", "all"):
+        return requested
+    return "all" if self_scope == "venue" else "actor"
+
+
+async def _context_recall(
+    client: OVClient,
+    cfg: PluginConfig,
+    query: str,
+    session_id: str,
+    self_scope: str,
+    ledger: RecallLedger | None,
+    exclude: list[str],
+    api_key: str | None,
+    user_id: str | None,
+) -> dict[str, Any] | None:
+    """Ask for server-side context assembly.
+
+    Returns:
+        ``None`` when the context face could not be used (caller should fall
+        back to ranked hits); otherwise a dict with ``entries``, ``text`` (the
+        server's digest/rendered fallback) and ``stats``. An empty ``entries``
+        with empty ``text`` means "the server had nothing relevant" — that is a
+        terminal answer, not a reason to run another search.
+    """
+    budget = int(getattr(cfg, "recall_token_budget", 0) or 0)
+    timeout_ms = int(getattr(cfg, "recall_timeout_ms", 0) or 0)
+    try:
+        result = await client.search_context(
+            query,
+            session_id=session_id,
+            peer_scope=_resolve_peer_scope(cfg, ledger, self_scope),
+            max_tokens=budget,
+            dedup_turns=int(getattr(cfg, "recall_dedup_turns", 0) or 0),
+            query_expansion=("auto" if getattr(cfg, "recall_query_expansion", True) else "off"),
+            rewrite=bool(getattr(cfg, "recall_rewrite", False)),
+            min_score=cfg.recall_min_score,
+            exclude_uris=exclude,
+            timeout=max(1.0, timeout_ms / 1000.0) if timeout_ms else None,
+            api_key=api_key,
+            user_id=user_id,
+        )
+    except ContextSearchUnsupported as exc:
+        if ledger is not None:
+            if exc.field == "peer_scope":
+                # Narrow from the next turn on. Do not widen, and do not spend a
+                # second slow request inside this turn retrying.
+                await ledger.mark_peer_scope_unsupported(exc.detail)
+            else:
+                await ledger.mark_context_unsupported(exc.field, exc.detail)
+        return None
+
+    if result is None:
+        return None
+
+    stats = result.get("stats") or {}
+    if str(stats.get("rewrite") or "") == "no_relevant":
+        return {"entries": [], "text": "", "stats": stats}
+
+    entries = [
+        entry
+        for entry in (result.get("entries") or [])
+        if isinstance(entry, dict)
+        and float(entry.get("score") or 0) >= cfg.recall_min_score
+        and entry.get("uri") not in exclude
+    ]
+    text = str(result.get("digest") or result.get("rendered") or "").strip()
+    return {"entries": entries, "text": text, "stats": stats}
+
+
 async def recall_and_format(
     client: OVClient,
     cfg: PluginConfig,
@@ -161,33 +264,188 @@ async def recall_and_format(
     user_id: str | None = None,
     speaker_id: str | None = None,
     active_member_ids: list[str] | None = None,
+    session_id: str = "",
+    self_scope: str = "global",
+    ledger: RecallLedger | None = None,
 ) -> str | None:
-    if not cfg.auto_recall_enabled or not query.strip():
+    """Recall memories and render the injection block.
+
+    Three tiers, best first:
+
+    1. ``/search`` in context mode — server-side assembly, which is the only
+       face that runs the cross-turn dedup ledger, query expansion and token
+       budgeting. Needs ``session_id`` to be the session the capture path writes.
+    2. ``/search`` in list mode — keeps the explicit ``target_uri`` narrowing
+       and accepts ``session_id``, but no server-side dedup.
+    3. ``/find`` — the original path, kept for servers predating ``/search``.
+
+    Args:
+        client: OV HTTP client.
+        cfg: Plugin config snapshot.
+        query: Raw user message text.
+        venue_id: Venue identifier (drives labels and group detection).
+        ov_user_id: OV user id, used for the space in the degraded paths.
+        api_key: Bearer override for this venue.
+        user_id: Identity assertion (trusted mode only).
+        speaker_id: Current speaker, for peer narrowing.
+        active_member_ids: Recently-active peers, for peer narrowing.
+        session_id: OV session id; the context face's dedup ledger needs it.
+        self_scope: Effective ``global``/``venue`` scope for this venue.
+        ledger: Client-side recall state, when available.
+
+    Returns:
+        The rendered block, or None when there is nothing to inject.
+    """
+    text = _clean_query(query)
+    if not cfg.auto_recall_enabled or len(text) < _MIN_QUERY_CHARS:
         return None
 
+    exclude: list[str] = []
+    if session_id and ledger is not None:
+        exclude = await ledger.recent_uris(session_id)
+
+    # -- tier 1: server-side context assembly --------------------------------
+    if getattr(cfg, "recall_context_enabled", True) and (ledger is None or ledger.context_face_ok):
+        context = await _context_recall(
+            client, cfg, text, session_id, self_scope, ledger, exclude, api_key, user_id
+        )
+        if context is not None:
+            block = _render_context_entries(cfg, context["entries"], venue_id) or _wrap(
+                context["text"]
+            )
+            if block:
+                await _remember(ledger, session_id, _uris_of(context["entries"]))
+            return block
+
+    # -- tier 2 / 3: ranked hits, then client-side ranking -------------------
     space = await _resolve_user_space(client, api_key, user_id)
     targets, peer_ids = _build_recall_targets(cfg, space, speaker_id, active_member_ids)
-
     per_source_limit = max(cfg.recall_limit * 2, 8) + 4 * len(peer_ids)
-    items = await client.find(
-        query=query,
+
+    items = await client.search_list(
+        query=text,
         target_uri=targets,
         limit=per_source_limit,
+        min_score=cfg.recall_min_score,
+        session_id=session_id,
         api_key=api_key,
         user_id=user_id,
     )
+    if items is None:  # endpoint missing or request failed → last resort
+        items = await client.find(
+            query=text,
+            target_uri=targets,
+            limit=per_source_limit,
+            api_key=api_key,
+            user_id=user_id,
+        )
     if not items:
         return None
 
-    profile = _build_query_profile(query)
-    filtered = [it for it in items if it.get("score", 0) >= cfg.recall_min_score]
+    profile = _build_query_profile(text)
+    filtered = [
+        it
+        for it in items
+        if it.get("score", 0) >= cfg.recall_min_score and it.get("uri") not in exclude
+    ]
     filtered.sort(key=lambda it: _rank_item(it, profile), reverse=True)
     picked = _dedup(filtered)[: cfg.recall_limit]
-
     if not picked:
         return None
 
-    return await _build_injection_block(client, cfg, picked, venue_id, api_key, user_id)
+    block = await _build_injection_block(client, cfg, picked, venue_id, api_key, user_id)
+    if block:
+        await _remember(ledger, session_id, _uris_of(picked))
+    return block
+
+
+def _uris_of(items: list[dict[str, Any]]) -> list[str]:
+    return [str(item.get("uri")) for item in items if item.get("uri")]
+
+
+async def _remember(ledger: RecallLedger | None, session_id: str, uris: list[str]) -> None:
+    """Persist what we just injected, so the next turn can exclude it."""
+    if ledger is not None and session_id and uris:
+        await ledger.record(session_id, uris)
+
+
+def _wrap(text: str) -> str | None:
+    """Wrap a server-rendered digest as the injection block."""
+    body = (text or "").strip()
+    return f"{_BLOCK_OPEN}\n{body}\n{_BLOCK_CLOSE}" if body else None
+
+
+def _entry_header(
+    score_pct: int,
+    origin_label: str,
+    uri: str,
+    *,
+    is_group: bool,
+    abstract: str,
+) -> str:
+    """``[memory 62% · origin · about:<peer>]`` for one entry."""
+    header = f"[memory {score_pct}% · {origin_label}"
+    peer = _peer_from_uri(uri)
+    if peer:
+        header += f" · about:{peer}"
+    else:
+        sender = _extract_sender(abstract)
+        if is_group and sender:
+            header += f" · from:{sender}"
+    return header + "]"
+
+
+def _assemble_block(rows: list[tuple[str, str, str]], budget: int) -> str | None:
+    """Budget a list of ``(header, uri, content)`` rows into the block format.
+
+    Rows whose content does not fit keep a URI line instead, so the model always
+    has something to expand.
+    """
+    lines = [_BLOCK_OPEN, _BLOCK_HINT]
+    content_count = 0
+    for header, uri, content in rows:
+        uri_line = f"- {header} {uri}"
+        body = (content or "").strip()
+        if not body or budget <= 0:
+            lines.append(uri_line)
+            continue
+        content_line = f"- {header} {body}"
+        cost = estimate_tokens(content_line)
+        if cost > budget and content_count > 0:
+            lines.append(uri_line)
+            continue
+        lines.append(content_line)
+        budget -= cost
+        content_count += 1
+    if content_count == 0 and len(lines) == 2:
+        return None
+    lines.append(_BLOCK_CLOSE)
+    return "\n".join(lines)
+
+
+def _render_context_entries(
+    cfg: PluginConfig,
+    entries: list[dict[str, Any]],
+    venue_id: str,
+) -> str | None:
+    """Render context-face entries.
+
+    These entries differ from ranked hits: their body lives in ``text`` (already
+    fetched at whatever detail tier the server chose) and there is no
+    ``abstract``, so the ``from:<sender>`` label that the ranked path derives
+    from an abstract is unavailable here. ``about:<peer>`` still works, since
+    the URI is always present.
+    """
+    if not entries:
+        return None
+    origin_label = parse_venue_origin(venue_id)
+    rows: list[tuple[str, str, str]] = []
+    for entry in entries:
+        score_pct = max(0, min(100, int(float(entry.get("score") or 0) * 100)))
+        uri = str(entry.get("uri") or "")
+        header = _entry_header(score_pct, origin_label, uri, is_group=False, abstract="")
+        rows.append((header, uri, str(entry.get("text") or "")))
+    return _assemble_block(rows, cfg.recall_token_budget)
 
 
 async def _build_injection_block(
@@ -198,49 +456,16 @@ async def _build_injection_block(
     api_key: str | None,
     user_id: str | None = None,
 ) -> str | None:
-    budget = cfg.recall_token_budget
     is_group = venue_is_group(venue_id)
     origin_label = parse_venue_origin(venue_id)
-
-    lines = [
-        "<openviking-context>",
-        "Relevant context from OpenViking. Use the read MCP tool to expand URIs.",
-    ]
-    content_count = 0
-
+    rows: list[tuple[str, str, str]] = []
     for item in items:
         score_pct = max(0, min(100, int(item.get("score", 0) * 100)))
         uri = item.get("uri", "")
         abstract = (item.get("abstract") or item.get("overview") or "").strip()
-
-        header = f"[memory {score_pct}%"
-        header += f" · {origin_label}"
-        peer = _peer_from_uri(uri)
-        if peer:
-            header += f" · about:{peer}"
-        else:
-            sender = _extract_sender(abstract)
-            if is_group and sender:
-                header += f" · from:{sender}"
-        header += "]"
-
-        uri_line = f"- {header} {uri}"
-
-        if budget > 0:
-            content = await _resolve_content(client, item, cfg, api_key, user_id)
-            content_line = f"- {header} {content}"
-            cost = estimate_tokens(content_line)
-            if cost > budget and content_count > 0:
-                lines.append(uri_line)
-            else:
-                lines.append(content_line)
-                budget -= cost
-                content_count += 1
-        else:
-            lines.append(uri_line)
-
-    lines.append("</openviking-context>")
-    return "\n".join(lines)
+        header = _entry_header(score_pct, origin_label, uri, is_group=is_group, abstract=abstract)
+        rows.append((header, uri, await _resolve_content(client, item, cfg, api_key, user_id)))
+    return _assemble_block(rows, cfg.recall_token_budget)
 
 
 async def _resolve_content(
@@ -252,6 +477,12 @@ async def _resolve_content(
 ) -> str:
     uri = item.get("uri", "")
     abstract = (item.get("abstract") or item.get("overview") or "").strip()
+
+    # List-mode search can inline the body (read_content=true); prefer it, as it
+    # saves one content/read round-trip per hit.
+    inline = item.get("content")
+    if isinstance(inline, str) and inline.strip():
+        return inline.strip()
 
     if item.get("level") == 2 and uri:
         full = await client.read_content(uri, api_key=api_key, user_id=user_id)

@@ -54,9 +54,15 @@
 | `peer_recall_active_window` | `5` | `speaker_plus_active` 下额外召回的近期活跃成员上限 |
 | `trusted_mode` | `false` | 仅当 OV 以 `auth_mode=trusted`（受信网关后）运行时开启，会发送 `X-OpenViking-Account/User` 头 |
 | `auto_recall_enabled` | `true` | 是否自动召回 |
-| `recall_limit` | `8` | 最多召回条数 |
+| `recall_limit` | `8` | 最多召回条数（降级到 list/find 档时的上限） |
 | `recall_min_score` | `0.35` | 语义匹配最低分 |
-| `recall_token_budget` | `2000` | 注入上下文的 token 预算 |
+| `recall_token_budget` | `2000` | 注入上下文的 token 预算（context 档也用它作为服务端 `max_tokens`） |
+| `recall_context_enabled` | `true` | 走服务端 context 组装（跨轮去重 + query 扩展 + 预算）。关闭则退回普通排序检索 |
+| `recall_dedup_turns` | `3` | N 轮内已注入过的记忆不再重复注入（仅 context 档）；群聊可调小到 `1` |
+| `recall_peer_scope` | `auto` | context 档可读哪些 peer：`auto`（`venue` 下为 `all`，`global` 下为 `actor`）/ `actor` / `all`。⚠️ `all` 会扫该 OV user 下所有 peer，仅当每群有独立 user（`venue`）时才安全 |
+| `recall_query_expansion` | `true` | 允许服务端先扩展 query 再检索（对缩写、单词追问有效，增加延迟） |
+| `recall_rewrite` | `false` | 要服务端生成重写摘要而非原始条目；明显更慢，开启时建议同步调大 `recall_timeout_ms` |
+| `recall_timeout_ms` | `12000` | 召回请求超过此时长就放弃且不注入（毫秒） |
 | `commit_message_threshold` | `20` | 累积 N 条消息后自动 commit |
 | `commit_token_threshold` | `4096` | 累积 token 超过此值后自动 commit |
 | `commit_idle_seconds` | `1800` | 空闲 N 秒后自动 commit（也用作 peer 召回的「近期」时间窗） |
@@ -84,7 +90,12 @@
 
 所有 peer 都挂在同一个 bot self 空间下（`viking://user/<bot>/peers/*`）。默认召回 self + 当前说话人 + 近期活跃成员的画像；因此 A 在群里提问时，bot 也能召回最近活跃的 B、C 的画像（例如「Bob 喜欢什么」）。
 
-> OpenViking 不允许「一次搜全部 peer」，每个要召回的人必须显式点名——本插件通过 `peer_recall_scope` 控制点名范围。这比旧的 fanout 干净：每个人的画像只存一份，不做有损复制。
+召回的取值方式分两档：
+
+- **context 档（默认）**：身份交给服务端解析，插件只传 `peer_scope`。`venue` 隔离下 OV user 就是本群，`all` = 本群所有 peer，正是想要的效果；`global` 下 user 跨群共享，`all` 会扫到别的群的 peer，所以**强制收窄为 `actor`**。若服务端拒绝 `peer_scope`，插件只会收窄到 `actor` 并告警，**绝不会放宽**。
+- **降级档（list / find）**：服务端不提供身份解析，只能像以前那样**逐个显式点名** `target_uri`，点名范围由 `peer_recall_scope` 控制。
+
+这也意味着 `peer_recall_scope` 只影响降级档；context 档看 `recall_peer_scope`。
 
 ## 图片转写
 

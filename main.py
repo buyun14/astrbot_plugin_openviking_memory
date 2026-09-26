@@ -48,6 +48,7 @@ from .ov_client.parts import (
 )
 from .ov_client.presence import PresenceTracker
 from .ov_client.recall import recall_and_format
+from .ov_client.recall_ledger import RecallLedger
 
 
 class OpenVikingMemoryPlugin(Star):
@@ -86,6 +87,11 @@ class OpenVikingMemoryPlugin(Star):
             kv_get=self._kv_get,
             kv_put=self._kv_put,
             kv_prefix=self._kv_prefix,
+        )
+        self.recall_ledger = RecallLedger(
+            kv_get=self._kv_get,
+            kv_put=self._kv_put,
+            prefix=self._kv_prefix,
         )
         # venue_id -> (api_key, fallback_user_id). fallback_user_id is only used
         # for X-OpenViking-User assertion in trusted_mode.
@@ -362,6 +368,7 @@ class OpenVikingMemoryPlugin(Star):
             return
 
         active = self.presence.active(venue_id, exclude=peer_id)
+        await self.recall_ledger.load()
         block = await recall_and_format(
             self.ov,
             self.cfg,
@@ -370,6 +377,9 @@ class OpenVikingMemoryPlugin(Star):
             ov_user_id,
             speaker_id=info["sender_id"],
             active_member_ids=active,
+            session_id=session_id,
+            self_scope=get_effective_self_scope(self.cfg, info["group_id"]),
+            ledger=self.recall_ledger,
             **auth,
         )
         if block:
@@ -493,6 +503,21 @@ class OpenVikingMemoryPlugin(Star):
 
         peer_status = f"on ({self.cfg.peer_recall_scope})" if self.cfg.peer_enabled else "off"
 
+        await self.recall_ledger.load()
+        snap = self.recall_ledger.snapshot()
+        effective_scope = self.recall_ledger.resolve_peer_scope(
+            self.cfg.recall_peer_scope, self_scope=scope
+        )
+        if not self.cfg.recall_context_enabled:
+            recall_status = "ranked only (recall_context_enabled=false)"
+        elif snap["context_face"] == "unsupported":
+            recall_status = (
+                f"context unavailable ({snap['context_face_reason'] or 'server refused'})"
+            )
+        else:
+            recall_status = "context"
+        recalled_uris = snap["rings"].get(session_id, 0)
+
         lines = [
             "OpenViking Memory Plugin v0.2.0",
             f"Server: {self.cfg.ov_base_url} ({'OK' if healthy else 'UNREACHABLE'})",
@@ -505,6 +530,7 @@ class OpenVikingMemoryPlugin(Star):
             f"Pending: {sched['pending_messages']} msgs / ~{sched['pending_tokens']} tokens",
             f"Last commit: {_fmt_ts(sched['last_commit_ts'])}",
             f"Backfill: {bf_status}",
+            f"Recall: {recall_status}, peer_scope={effective_scope}, dedup ring={recalled_uris}",
             f"Active peers: {len(self.presence.active(venue_id))}",
             f"Venues: {len(self._venue_auth)}",
         ]
