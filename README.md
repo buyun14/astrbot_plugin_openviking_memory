@@ -67,6 +67,10 @@
 | `commit_message_threshold` | `20` | 累积 N 条消息后自动 commit |
 | `commit_token_threshold` | `4096` | 累积 token 超过此值后自动 commit |
 | `commit_idle_seconds` | `1800` | 空闲 N 秒后自动 commit（也用作 peer 召回的「近期」时间窗） |
+| `outbox_enabled` | `true` | OV 暂时收不下（限流、重启）时，把捕获写入落盘并在稍后按序重放，而不是丢消息 |
+| `outbox_max_pending` | `200` | 每个 venue 的待重放上限，超出后丢最旧的 |
+| `outbox_ttl_hours` | `24` | 待重放消息超过此时长就丢弃，避免长期故障把队列涨爆 |
+| `outbox_flush_interval_seconds` | `60` | 后台重放循环的间隔 |
 | `backfill_on_first_seen` | `true` | 首次接入群聊时拉取历史 |
 | `backfill_max_messages` | `500` | 每群最多拉取历史条数 |
 | `ingest_attachments` | `false` | 是否将图片/文件推送至 OV resources（需 VLM） |
@@ -99,6 +103,18 @@
 这也意味着 `peer_recall_scope` 只影响降级档；context 档看 `recall_peer_scope`。
 
 > `global` 隔离下 `peer_scope` 强制为 `actor`，因此「A 问 Bob 喜欢什么」这类跨人召回会失失。要补回这个能力，把 `recall_include_active_peers` 设为 `true`：插件会在 context 结果之上再发一次**限定在活跃成员自身空间**的排序检索，URI 去重后合并进同一个块。代价是每轮多一次请求；`venue` 隔离下 `peer_scope=all` 已覆盖全部 peer，该项自动跳过。
+
+## 写入可靠性（outbox）
+
+捕获到的消息是插件**无法重建**的东西：唯一副本就是平台侧的场景，一旦丢就真的没了。因此所有捕获写入（文本、图片转写、工具 I/O、历史回填）统一经一个落盘队列：
+
+- 写入失败时先落盘，再于后台按间隔重放；
+- **严格保序**：某 venue 的头一条没送达时，后续消息不会绕过它，否则会话读起来是乱序的、抽取出的记忆也是错的；
+- 只重试“稍后可能成功”的失败（超时 / 408 / 425 / 429 / 5xx / 连接错误）；4xx 这类确定性失败（如凭据错误）直接丢弃并唨 error，否则会永久堵住队列；
+- 每个 venue 有上限、条目有 TTL，长时间故障不会把数据库涨爆；
+- **队列不存凭据**：只存“说了什么”，Bearer 身份在重放时重新解析。
+
+队列深度、已重放数、已丢弃数可在 `/ov_status` 的 `Outbox:` 行看到。
 
 ## 图片转写
 

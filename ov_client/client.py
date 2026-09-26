@@ -86,6 +86,15 @@ def _search_hits(result: Any) -> list[dict[str, Any]]:
     return hits
 
 
+# Statuses that mean "try again later" rather than "this request is wrong".
+# 408 request timeout, 425 too early, 429 rate limited, 5xx server side.
+RETRYABLE_STATUS = frozenset({408, 425, 429})
+
+
+def _retryable_status(status: int) -> bool:
+    return status in RETRYABLE_STATUS or status >= 500
+
+
 class OVClient:
     """Thin wrapper over OV REST endpoints needed by the plugin."""
 
@@ -168,21 +177,56 @@ class OVClient:
         user_id: str | None = None,
         peer_id: str | None = None,
     ) -> bool:
+        ok, _retryable, _detail = await self.add_message_verbose(
+            session_id, payload, api_key=api_key, user_id=user_id, peer_id=peer_id
+        )
+        return ok
+
+    async def add_message_verbose(
+        self,
+        session_id: str,
+        payload: dict[str, Any],
+        api_key: str | None = None,
+        user_id: str | None = None,
+        peer_id: str | None = None,
+    ) -> tuple[bool, bool, str]:
+        """Append a message, reporting whether a retry could help.
+
+        Transport errors are swallowed and reported as retryable: a hook that
+        raises would take down the message pipeline, and an append that failed
+        on the wire is exactly what the outbox exists to replay.
+
+        Args:
+            session_id: Target OV session.
+            payload: Message body.
+            api_key: Bearer override.
+            user_id: Identity assertion (trusted mode only).
+            peer_id: Stable id of "the other party" (peer contract); set on
+                incoming messages so commit extracts peer memory.
+
+        Returns:
+            ``(delivered, retryable, detail)``. ``retryable`` is only meaningful
+            when ``delivered`` is False.
+        """
         import json as _json
 
-        # peer_id (peer contract) tags the message with the stable id of "the
-        # other party"; set on incoming messages so commit extracts peer memory.
         if peer_id:
             payload = {**payload, "peer_id": peer_id}
         body = _json.dumps(payload, ensure_ascii=False, default=str)
-        r = await self._http.post(
-            f"{self.base_url}/api/v1/sessions/{quote(session_id)}/messages",
-            headers=self._headers(api_key=api_key, user_id=user_id),
-            content=body,
-        )
-        if r.status_code != 200:
-            logger.warning("add_message %s failed: %d", session_id, r.status_code)
-        return r.status_code == 200
+        try:
+            r = await self._http.post(
+                f"{self.base_url}/api/v1/sessions/{quote(session_id)}/messages",
+                headers=self._headers(api_key=api_key, user_id=user_id),
+                content=body,
+            )
+        except httpx.HTTPError as e:
+            return False, True, f"transport error: {type(e).__name__}"
+        if r.status_code == 200:
+            return True, False, ""
+        detail = f"HTTP {r.status_code}: {r.text[:200]}"
+        if _retryable_status(r.status_code):
+            logger.warning("add_message %s failed: HTTP %d", session_id, r.status_code)
+        return False, _retryable_status(r.status_code), detail
 
     async def commit_session(
         self,

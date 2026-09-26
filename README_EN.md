@@ -60,6 +60,10 @@ All fields are configured via AstrBot WebUI after installation.
 | `commit_message_threshold` | `20` | Auto-commit after N messages |
 | `commit_token_threshold` | `4096` | Auto-commit when tokens exceed this |
 | `commit_idle_seconds` | `1800` | Auto-commit after N seconds idle (also the "recent" window for peer recall) |
+| `outbox_enabled` | `true` | Persist capture writes OpenViking could not accept (rate limits, restarts) and replay them in order instead of losing the messages |
+| `outbox_max_pending` | `200` | Per-venue cap on queued messages; the oldest are dropped once exceeded |
+| `outbox_ttl_hours` | `24` | Discard queued messages older than this, so a long outage cannot grow the queue forever |
+| `outbox_flush_interval_seconds` | `60` | How often the background drainer retries queued messages |
 | `backfill_on_first_seen` | `true` | Pull history on first group encounter |
 | `backfill_max_messages` | `500` | Max messages to backfill |
 | `ingest_attachments` | `false` | Push images/files to OV resources |
@@ -92,6 +96,30 @@ How the peer set is selected depends on the tier in use:
 In other words `peer_recall_scope` only affects the degraded tier; the context tier reads `recall_peer_scope`.
 
 > Under `global` scope `peer_scope` is forced down to `actor`, which costs cross-person recall ("what does Bob like?" asked by A). Set `recall_include_active_peers` to `true` to get it back: the plugin then runs one extra ranked search **scoped to the active members' own spaces** and merges it into the same block after URI dedup. The cost is one extra request per turn; under `venue` scope, where `peer_scope=all` already covers every peer, the supplement is skipped automatically.
+
+## Write durability (outbox)
+
+Captured messages are the one thing this plugin cannot re-derive: the bot's transcript is the only copy, so a lost message is lost for good. Every capture write (text, image transcripts, tool I/O, history backfill) therefore goes through a persisted queue:
+
+- a failed write is stored and retried by a background drainer;
+- **order is preserved**: while a venue's head message is undelivered, later ones do not overtake it — otherwise the session reads out of order and the extracted memory is wrong;
+- only failures that can succeed later are retried (timeouts, 408/425/429/5xx, connection errors). Deterministic 4xx failures are dropped with an error log, since retrying them would block the queue forever;
+- each venue's queue is bounded and entries expire, so a long outage cannot grow the database without limit;
+- **credentials are never stored** — the queue holds only what was said, and the Bearer identity is resolved again at replay time.
+
+Queue depth, replayed count and dropped count are shown on the `Outbox:` line of `/ov_status`.
+
+## Write durability (outbox)
+
+Captured messages are the one thing this plugin cannot re-derive: the bot's transcript is the only copy, so a lost message is lost for good. Every capture write (text, image transcripts, tool I/O, history backfill) therefore goes through a persisted queue:
+
+- a failed write is stored and retried by a background drainer;
+- **order is preserved**: while a venue's head message is undelivered, later ones do not overtake it — otherwise the session reads out of order and the extracted memory is wrong;
+- only failures that can succeed later are retried (timeouts, 408/425/429/5xx, connection errors). Deterministic 4xx failures are dropped with an error log, since retrying them would block the queue forever;
+- each venue's queue is bounded and entries expire, so a long outage cannot grow the database without limit;
+- **credentials are never stored** — the queue holds only what was said, and the Bearer identity is resolved again at replay time.
+
+Queue depth, replayed count and dropped count are shown on the `Outbox:` line of `/ov_status`.
 
 ## Image transcription
 

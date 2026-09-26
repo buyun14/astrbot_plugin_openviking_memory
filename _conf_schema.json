@@ -123,6 +123,26 @@
     "type": "int",
     "default": 1800
   },
+  "outbox_enabled": {
+    "description": "Persist capture writes that OpenViking could not accept (rate limits, restarts) and replay them in order instead of losing the messages",
+    "type": "bool",
+    "default": true
+  },
+  "outbox_max_pending": {
+    "description": "Per-venue cap on queued messages; the oldest are dropped once exceeded",
+    "type": "int",
+    "default": 200
+  },
+  "outbox_ttl_hours": {
+    "description": "Discard queued messages older than this many hours, so a long outage cannot grow the queue forever",
+    "type": "int",
+    "default": 24
+  },
+  "outbox_flush_interval_seconds": {
+    "description": "How often the background drainer retries queued messages",
+    "type": "int",
+    "default": 60
+  },
   "ingest_attachments": {
     "description": "Push images/files to OV resources for VLM indexing",
     "type": "bool",

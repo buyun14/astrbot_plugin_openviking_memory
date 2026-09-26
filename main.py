@@ -34,6 +34,7 @@ from .ov_client.identity import (
     venue_is_group,
 )
 from .ov_client.injection import inject_recall_block
+from .ov_client.outbox import Outbox
 from .ov_client.parts import (
     assistant_text_part,
     build_message,
@@ -81,21 +82,32 @@ class OpenVikingMemoryPlugin(Star):
             window=self.cfg.peer_recall_active_window,
             ttl_seconds=float(self.cfg.commit_idle_seconds),
         )
+        # venue_id -> (api_key, fallback_user_id). fallback_user_id is only used
+        # for X-OpenViking-User assertion in trusted_mode.
+        self._venue_auth: dict[str, tuple[str, str]] = {}
+        self.outbox = Outbox(
+            kv_get=self._kv_get,
+            kv_put=self._kv_put,
+            client=self.ov,
+            prefix=self._kv_prefix,
+            auth_resolver=self._auth,
+            max_pending=self.cfg.outbox_max_pending,
+            ttl_seconds=self.cfg.outbox_ttl_hours * 3600,
+        )
+        self._drainer: asyncio.Task | None = None
         self.backfill = BackfillManager(
             self.ov,
             self.cfg,
             kv_get=self._kv_get,
             kv_put=self._kv_put,
             kv_prefix=self._kv_prefix,
+            outbox=self.outbox,
         )
         self.recall_ledger = RecallLedger(
             kv_get=self._kv_get,
             kv_put=self._kv_put,
             prefix=self._kv_prefix,
         )
-        # venue_id -> (api_key, fallback_user_id). fallback_user_id is only used
-        # for X-OpenViking-User assertion in trusted_mode.
-        self._venue_auth: dict[str, tuple[str, str]] = {}
 
     async def _kv_get(self, key: str, default: Any = None) -> Any:
         return await self.get_kv_data(key, default)
@@ -179,10 +191,56 @@ class OpenVikingMemoryPlugin(Star):
     def _peer_id_for(self, sender_id: str) -> str | None:
         return safe_peer_id(sender_id) if self.cfg.peer_enabled else None
 
+    # -- capture writes -------------------------------------------------------
+
+    async def _capture(
+        self,
+        venue_id: str,
+        session_id: str,
+        message: dict[str, Any],
+        *,
+        peer_id: str | None = None,
+    ) -> bool:
+        """Write one capture message, queueing it when OV cannot take it now.
+
+        Returns:
+            True when the message is in OV; False when it is queued for replay
+            or was rejected outright.
+        """
+        if not self.cfg.outbox_enabled:
+            return await self.ov.add_message(
+                session_id, message, peer_id=peer_id, **self._auth(venue_id)
+            )
+        self._ensure_drainer()
+        return await self.outbox.send(venue_id, session_id, message, peer_id=peer_id)
+
+    def _ensure_drainer(self) -> None:
+        """Start the outbox replay loop on first use.
+
+        Started lazily rather than from ``on_astrbot_loaded``: that hook does not
+        fire again on a hot reload, which would leave a reloaded plugin with no
+        drainer and a queue that never moves.
+        """
+        if self._drainer is not None and not self._drainer.done():
+            return
+        self._drainer = asyncio.create_task(self._drain_loop())
+
+    async def _drain_loop(self) -> None:
+        interval = max(5, int(self.cfg.outbox_flush_interval_seconds))
+        while True:
+            await asyncio.sleep(interval)
+            try:
+                await self.outbox.flush_all()
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                self.logger.exception("[OV] outbox drain failed")
+
     # -- hook: on_astrbot_loaded ----------------------------------------------
 
     @filter.on_astrbot_loaded()
     async def on_loaded(self):
+        await self.outbox.load()
         ok = await self.ov.health()
         if ok:
             self.logger.info(
@@ -237,20 +295,18 @@ class OpenVikingMemoryPlugin(Star):
             ]
             if msg_chain:
                 self._append_media_placeholders(msg_chain, parts)
-            ok = await self.ov.add_message(
-                session_id, build_message("user", parts), peer_id=peer_id, **auth
+            ok = await self._capture(
+                venue_id, session_id, build_message("user", parts), peer_id=peer_id
             )
             if ok:
                 self.scheduler.set_auth(session_id, auth)
                 await self.scheduler.record_message(session_id, estimate_tokens(info["text"]))
-            else:
-                self.logger.warning("[OV] add_message failed for %s", session_id)
 
         # Actively transcribe every image (not just bot-directed ones) in the
         # background so the VLM call doesn't block message handling.
         if images:
             asyncio.create_task(
-                self._caption_images(images, session_id, auth, peer_id, info, is_group)
+                self._caption_images(images, venue_id, session_id, auth, peer_id, info, is_group)
             )
 
         await self.backfill.maybe_trigger(
@@ -292,7 +348,7 @@ class OpenVikingMemoryPlugin(Star):
             or "请用中文描述这张图片，尽量包含其中的文字内容。"
         )
 
-    async def _caption_images(self, images, session_id, auth, peer_id, info, is_group):
+    async def _caption_images(self, images, venue_id, session_id, auth, peer_id, info, is_group):
         provider = self._image_caption_provider()
         if provider is None:
             return
@@ -310,8 +366,8 @@ class OpenVikingMemoryPlugin(Star):
             part = image_caption_part(
                 cap, info["sender_name"], info["sender_id"], is_group, info["group_id"]
             )
-            if await self.ov.add_message(
-                session_id, build_message("user", [part]), peer_id=peer_id, **auth
+            if await self._capture(
+                venue_id, session_id, build_message("user", [part]), peer_id=peer_id
             ):
                 self.scheduler.set_auth(session_id, auth)
                 await self.scheduler.record_message(session_id, estimate_tokens(cap))
@@ -358,8 +414,8 @@ class OpenVikingMemoryPlugin(Star):
                 part = image_caption_part(
                     cap, info["sender_name"], info["sender_id"], is_group, info["group_id"]
                 )
-                if await self.ov.add_message(
-                    session_id, build_message("user", [part]), peer_id=peer_id, **auth
+                if await self._capture(
+                    venue_id, session_id, build_message("user", [part]), peer_id=peer_id
                 ):
                     self.scheduler.set_auth(session_id, auth)
                     await self.scheduler.record_message(session_id, estimate_tokens(cap))
@@ -411,7 +467,7 @@ class OpenVikingMemoryPlugin(Star):
         session_id = derive_session_id(venue_id)
         parts = [assistant_text_part(reply_text)]
         payload = build_message("assistant", parts)
-        if await self.ov.add_message(session_id, payload, **auth):
+        if await self._capture(venue_id, session_id, payload):
             self.scheduler.set_auth(session_id, auth)
         await self.scheduler.record_message(session_id, estimate_tokens(reply_text))
 
@@ -434,7 +490,7 @@ class OpenVikingMemoryPlugin(Star):
         auth = self._auth(venue_id)
         session_id = derive_session_id(venue_id)
         payload = build_message("assistant", [tool_call_part(t_name, tool_args)])
-        if await self.ov.add_message(session_id, payload, **auth):
+        if await self._capture(venue_id, session_id, payload):
             self.scheduler.set_auth(session_id, auth)
             # Tool traffic is part of the session: it must be counted too, or a
             # tool-heavy turn never reaches the commit thresholds. It also has to
@@ -461,7 +517,7 @@ class OpenVikingMemoryPlugin(Star):
         session_id = derive_session_id(venue_id)
         result_text = _tool_result_text(tool_result)
         payload = build_message("assistant", [tool_result_part(t_name, result_text)])
-        if await self.ov.add_message(session_id, payload, **auth):
+        if await self._capture(venue_id, session_id, payload):
             self.scheduler.set_auth(session_id, auth)
             # Counted for the same reason as the tool-call part above.
             await self.scheduler.record_message(session_id, estimate_tokens(result_text))
@@ -517,6 +573,8 @@ class OpenVikingMemoryPlugin(Star):
         else:
             recall_status = "context"
         recalled_uris = snap["rings"].get(session_id, 0)
+        outbox_snap = self.outbox.snapshot()
+        outbox_pending = outbox_snap["venues"].get(venue_id, 0)
         supplement = ""
         if self.cfg.recall_include_active_peers and effective_scope == "actor":
             supplement = ", active-peer supplement=on"
@@ -537,6 +595,8 @@ class OpenVikingMemoryPlugin(Star):
             f"Backfill: {bf_status}",
             f"Recall: {recall_status}, peer_scope={effective_scope}, "
             f"dedup ring={recalled_uris}{supplement}",
+            f"Outbox: {outbox_pending} pending (all venues: {sum(outbox_snap['venues'].values())}, "
+            f"sent={outbox_snap['sent']}, dropped={outbox_snap['dropped']})",
             f"Active peers: {len(self.presence.active(venue_id))}",
             f"Venues: {len(self._venue_auth)}",
         ]
@@ -565,6 +625,19 @@ class OpenVikingMemoryPlugin(Star):
     # -- lifecycle ------------------------------------------------------------
 
     async def terminate(self):
+        if self._drainer is not None and not self._drainer.done():
+            self._drainer.cancel()
+            try:
+                await self._drainer
+            except asyncio.CancelledError:
+                pass
+            except Exception:
+                self.logger.exception("[OV] outbox drainer stopped with an error")
+        # Last chance to empty the outbox before the HTTP client goes away.
+        try:
+            await self.outbox.flush_all()
+        except Exception:
+            self.logger.exception("[OV] outbox flush on shutdown failed")
         await self.scheduler.flush_all()
         await self.ov.close()
         self.logger.info("[OV] plugin terminated, all sessions flushed")
