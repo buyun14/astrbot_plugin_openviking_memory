@@ -418,6 +418,59 @@ def test_private_method_calls_match_their_signatures():
     assert not mismatches, "call/definition arity mismatch: " + "; ".join(mismatches)
 
 
+def test_no_annotation_hides_a_none_return():
+    """A return annotation must admit None when any path returns it.
+
+    search_list was annotated ``list[dict]`` while returning None on a transport
+    error, a non-JSON body and a non-200 status. Both callers already handled
+    None, so the behaviour was right and only the annotation lied — but a caller
+    trusting it would call a list method on the degradation path.
+
+    A bare ``return`` is excluded inside generators, where it ends iteration
+    rather than producing None.
+    """
+    import ast
+
+    def own_scope(node: ast.AST) -> list[ast.AST]:
+        """Nodes in this function's scope, not descending into nested ones."""
+        found: list[ast.AST] = []
+        stack = list(getattr(node, "body", []))
+        while stack:
+            current = stack.pop()
+            if isinstance(current, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda)):
+                continue
+            found.append(current)
+            stack.extend(ast.iter_child_nodes(current))
+        return found
+
+    root = pathlib.Path(__file__).resolve().parents[1]
+    sources = [root / "main.py", *sorted((root / "ov_client").glob("*.py"))]
+
+    offenders: list[str] = []
+    for source in sources:
+        tree = ast.parse(source.read_text(encoding="utf-8"))
+        for node in ast.walk(tree):
+            if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                continue
+            if node.returns is None or "None" in ast.unparse(node.returns):
+                continue
+            scoped = own_scope(node)
+            if any(isinstance(inner, (ast.Yield, ast.YieldFrom)) for inner in scoped):
+                continue
+            for inner in scoped:
+                returns_none = isinstance(inner, ast.Return) and (
+                    inner.value is None
+                    or (isinstance(inner.value, ast.Constant) and inner.value.value is None)
+                )
+                if returns_none:
+                    offenders.append(
+                        f"{source.name}:{inner.lineno} {node.name} -> {ast.unparse(node.returns)}"
+                    )
+                    break
+
+    assert not offenders, "annotation hides a None return: " + "; ".join(offenders)
+
+
 def test_commit_accounting_only_happens_after_delivery():
     """record_message must stay behind a delivery check.
 

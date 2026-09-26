@@ -394,7 +394,7 @@ class OVClient:
         session_id: str = "",
         api_key: str | None = None,
         user_id: str | None = None,
-    ) -> list[dict[str, Any]]:
+    ) -> list[dict[str, Any]] | None:
         """``POST /search`` in list mode: ranked hits, session-aware.
 
         List mode keeps ``target_uri`` (so the caller's multi-peer narrowing
