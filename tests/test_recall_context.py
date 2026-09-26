@@ -231,6 +231,52 @@ def test_search_list_distinguishes_empty_from_failed():
     assert _run_with_mock(broken, lambda c: c.search_list("q")) is None
 
 
+# -- malformed response bodies ---------------------------------------------
+
+
+def test_a_200_with_a_non_json_body_degrades_instead_of_raising():
+    """A malformed body is a server fault, not a reason to blow up a hook.
+
+    Each of these decoded ``r.json()`` unguarded, so a 200 carrying an HTML
+    error page raised JSONDecodeError: into the recall path for the search
+    calls, into the background poll loop for get_task, and into shutdown for
+    the rest.
+    """
+
+    def html(request):
+        return httpx.Response(200, text="<html>502 Bad Gateway</html>")
+
+    assert _run_with_mock(html, lambda c: c.search_context("q")) is None
+    assert _run_with_mock(html, lambda c: c.search_list("q")) is None
+    assert _run_with_mock(html, lambda c: c.get_task("t")) is None
+    assert _run_with_mock(html, lambda c: c.commit_session("s")) is None
+    assert _run_with_mock(html, lambda c: c.get_session("s")) is None
+    assert _run_with_mock(html, lambda c: c.read_content("viking://m/1")) is None
+    assert _run_with_mock(html, lambda c: c.add_resource("/p", "viking://r/x")) is None
+    assert _run_with_mock(html, lambda c: c.find("q")) == []
+    assert _run_with_mock(html, lambda c: c.resolve_user_space()) == "default"
+    result, error = _run_with_mock(html, lambda c: c.create_user("u", "admin"))
+    assert result is None
+    assert "non-JSON" in error
+
+
+def test_a_200_with_an_unexpected_shape_is_treated_as_absent():
+    """A valid JSON body of the wrong type must not raise on ``.get``."""
+
+    def array(request):
+        return httpx.Response(200, json=[1, 2, 3])
+
+    def null_result(request):
+        return httpx.Response(200, json={"result": None})
+
+    assert _run_with_mock(array, lambda c: c.get_task("t")) is None
+    assert _run_with_mock(array, lambda c: c.search_context("q")) is None
+    assert _run_with_mock(array, lambda c: c.search_list("q")) is None
+    assert _run_with_mock(array, lambda c: c.find("q")) == []
+    assert _run_with_mock(array, lambda c: c.resolve_user_space()) == "default"
+    assert _run_with_mock(null_result, lambda c: c.get_task("t")) is None
+
+
 # -- ledger ---------------------------------------------------------------
 
 
@@ -669,3 +715,24 @@ def test_every_recall_call_site_passes_the_session_id():
         passed = {kw.arg for kw in call.keywords}
         assert "session_id" in passed, f"missing session_id at line {call.lineno}"
         assert "ledger" in passed, f"missing ledger at line {call.lineno}"
+
+
+def test_no_response_body_is_decoded_without_the_helper():
+    """Guard the pattern: an unguarded ``r.json()`` raises on a malformed 200.
+
+    The two allowed sites are the helper itself and ``_error_message``, which
+    wraps its decode and only runs on a 4xx.
+    """
+    source = pathlib.Path(__file__).resolve().parents[1] / "ov_client" / "client.py"
+    tree = ast.parse(source.read_text(encoding="utf-8"))
+    allowed = {"_json_body", "_error_message"}
+    offenders: list[str] = []
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.FunctionDef | ast.AsyncFunctionDef):
+            continue
+        if node.name in allowed:
+            continue
+        for call in ast.walk(node):
+            if isinstance(call, ast.Call) and getattr(call.func, "attr", None) == "json":
+                offenders.append(f"{node.name} at line {call.lineno}")
+    assert not offenders, "unguarded JSON decode: " + ", ".join(offenders)

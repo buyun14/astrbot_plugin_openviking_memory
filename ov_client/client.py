@@ -64,6 +64,31 @@ def _error_message(response: Any) -> str:
     return str(error)[:300]
 
 
+def _json_body(response: httpx.Response) -> dict[str, Any] | None:
+    """Decode a JSON object body, tolerating anything the server sends back.
+
+    A 200 whose body is not JSON at all, or is not a JSON object, is a
+    server-side fault rather than a caller error. Returning None lets callers
+    degrade exactly the way they already do for a transport failure, instead of
+    raising into whatever called them: a plugin hook, the background poll loop,
+    or the shutdown path.
+
+    Args:
+        response: The response to decode.
+
+    Returns:
+        The decoded object, or None when the body cannot be decoded or is not
+        an object.
+    """
+    try:
+        body = response.json()
+    except ValueError:
+        # httpx raises JSONDecodeError (a ValueError) for a non-JSON body,
+        # including an empty one or one that is not valid UTF-8.
+        return None
+    return body if isinstance(body, dict) else None
+
+
 def _unsupported_field(response: Any) -> str:
     """Decide whether a 4xx means "no context face" or "peer_scope rejected"."""
     message = _error_message(response).lower()
@@ -163,7 +188,9 @@ class OVClient:
         except Exception as e:
             return None, f"HTTP error: {e}"
         if r.status_code == 200:
-            body = r.json()
+            body = _json_body(r)
+            if body is None:
+                return None, f"HTTP 200 with a non-JSON body: {r.text[:200]}"
             return body.get("result", body), ""
         return None, f"HTTP {r.status_code}: {r.text[:300]}"
 
@@ -245,7 +272,8 @@ class OVClient:
             json=body,
         )
         if r.status_code == 200:
-            return r.json().get("result")
+            body = _json_body(r)
+            return body.get("result") if body is not None else None
         logger.warning("commit_session %s failed: %d", session_id, r.status_code)
         return None
 
@@ -262,7 +290,8 @@ class OVClient:
             headers=self._headers(api_key=api_key, user_id=user_id),
         )
         if r.status_code == 200:
-            return r.json().get("result")
+            body = _json_body(r)
+            return body.get("result") if body is not None else None
         return None
 
     async def get_task(
@@ -296,7 +325,8 @@ class OVClient:
             logger.debug("get_task %s transport error: %s", task_id, type(e).__name__)
             return None
         if r.status_code == 200:
-            result = r.json().get("result")
+            body = _json_body(r)
+            result = body.get("result") if body is not None else None
             return result if isinstance(result, dict) else None
         if r.status_code == 404:
             # Tasks can expire; treat that as terminal rather than polling forever.
@@ -329,7 +359,8 @@ class OVClient:
         if r.status_code != 200:
             logger.warning("find failed: %d", r.status_code)
             return []
-        result = r.json().get("result", {})
+        body = _json_body(r)
+        result = body.get("result", {}) if body is not None else {}
         if isinstance(result, list):
             return result
         items: list[dict[str, Any]] = []
@@ -347,7 +378,9 @@ class OVClient:
             headers=self._headers(api_key=api_key, user_id=user_id),
         )
         if r.status_code == 200:
-            user = r.json().get("result", {}).get("user", "")
+            body = _json_body(r)
+            result = body.get("result") if body is not None else None
+            user = result.get("user", "") if isinstance(result, dict) else ""
             if user and isinstance(user, str):
                 return user.strip()
         return "default"
@@ -395,7 +428,13 @@ class OVClient:
             logger.warning("search(list) transport error: %s", type(e).__name__)
             return None
         if r.status_code == 200:
-            return _search_hits(r.json().get("result"))
+            body = _json_body(r)
+            if body is None:
+                # Same handling as a transport failure: let the caller fall back
+                # to /find rather than reporting an empty result set.
+                logger.warning("search(list) returned a non-JSON body")
+                return None
+            return _search_hits(body.get("result"))
         logger.warning("search(list) failed: %d", r.status_code)
         return None
 
@@ -483,7 +522,11 @@ class OVClient:
             return None
 
         if r.status_code == 200:
-            result = r.json().get("result")
+            body = _json_body(r)
+            if body is None:
+                logger.warning("search(context) returned a non-JSON body")
+                return None
+            result = body.get("result")
             return result if isinstance(result, dict) else None
         if r.status_code in (404, 405):
             # A server old enough to have no /search at all.
@@ -507,7 +550,8 @@ class OVClient:
             headers=self._headers(api_key=api_key, user_id=user_id),
         )
         if r.status_code == 200:
-            result = r.json().get("result")
+            body = _json_body(r)
+            result = body.get("result") if body is not None else None
             return result if isinstance(result, str) else None
         return None
 
@@ -527,6 +571,7 @@ class OVClient:
             json={"path": path, "to": to_uri, "wait": wait},
         )
         if r.status_code == 200:
-            return r.json().get("result")
+            body = _json_body(r)
+            return body.get("result") if body is not None else None
         logger.warning("add_resource failed: %d", r.status_code)
         return None
