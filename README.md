@@ -25,7 +25,7 @@
 - **Peer 画像**：群成员的发言带上 `peer_id`（发送者），commit 时 OV 为每个人单独建立画像，存于 `viking://user/<bot>/peers/<sender_id>/`；bot 自己的回复与工具 I/O 归为 self
 - **结构化工具调用**：工具调用与结果以独立 `tool` part 入库（带 `tool_name`/`tool_input`/`tool_status`），不拼进正文，服务端可分别处理
 - **图片转写**：可把图片经视觉模型转成文字入库（见下「[图片转写](#图片转写)」）
-- **自动召回**：每次 LLM 请求前，插件检索 self（bot/群上下文）+ 当前说话人 + 近期活跃成员的画像并追加到系统提示
+- **自动召回**：每次 LLM 请求前，插件检索 self（bot/群上下文）+ 当前说话人 + 近期活跃成员的画像，作为临时内容块追加到当前用户消息**末尾**（不写入历史、不动 system prompt，避免击穿前缀缓存）
 - **自动提交**：根据消息数、token 估算值或空闲超时自动 commit session，触发长期记忆提取
 - **历史消化**：首次接入群聊时，自动拉取平台历史消息并入库（默认开启，可关闭）
 
@@ -54,12 +54,23 @@
 | `peer_recall_active_window` | `5` | `speaker_plus_active` 下额外召回的近期活跃成员上限 |
 | `trusted_mode` | `false` | 仅当 OV 以 `auth_mode=trusted`（受信网关后）运行时开启，会发送 `X-OpenViking-Account/User` 头 |
 | `auto_recall_enabled` | `true` | 是否自动召回 |
-| `recall_limit` | `8` | 最多召回条数 |
+| `recall_limit` | `8` | 最多召回条数（降级到 list/find 档时的上限） |
 | `recall_min_score` | `0.35` | 语义匹配最低分 |
-| `recall_token_budget` | `2000` | 注入上下文的 token 预算 |
+| `recall_token_budget` | `2000` | 注入上下文的 token 预算（context 档也用它作为服务端 `max_tokens`） |
+| `recall_context_enabled` | `true` | 走服务端 context 组装（跨轮去重 + query 扩展 + 预算）。关闭则退回普通排序检索 |
+| `recall_dedup_turns` | `3` | N 轮内已注入过的记忆不再重复注入（仅 context 档）；群聊可调小到 `1` |
+| `recall_peer_scope` | `auto` | context 档可读哪些 peer：`auto`（`venue` 下为 `all`，`global` 下为 `actor`）/ `actor` / `all`。⚠️ `all` 只在 `venue` 隔离下生效：`global` 下所有群共用一个 OV user，`all` 会扫到别的群的 peer，因此一律收窄为 `actor`（跨人召回请改用 `recall_include_active_peers`） |
+| `recall_query_expansion` | `true` | 允许服务端先扩展 query 再检索（对缩写、单词追问有效，增加延迟） |
+| `recall_rewrite` | `false` | 要服务端生成重写摘要而非原始条目；明显更慢，开启时建议同步调大 `recall_timeout_ms` |
+| `recall_timeout_ms` | `12000` | 召回请求超过此时长就放弃且不注入（毫秒） |
+| `recall_include_active_peers` | `false` | context 档只能看到当前说话人（`peer_scope=actor`）时，额外用一次排序检索补上近期活跃成员的画像 |
 | `commit_message_threshold` | `20` | 累积 N 条消息后自动 commit |
 | `commit_token_threshold` | `4096` | 累积 token 超过此值后自动 commit |
 | `commit_idle_seconds` | `1800` | 空闲 N 秒后自动 commit（也用作 peer 召回的「近期」时间窗） |
+| `outbox_enabled` | `true` | OV 暂时收不下（限流、重启）时，把捕获写入落盘并在稍后按序重放，而不是丢消息 |
+| `outbox_max_pending` | `200` | 每个 venue 的待重放上限，超出后丢最旧的 |
+| `outbox_ttl_hours` | `24` | 待重放消息超过此时长就丢弃，避免长期故障把队列涨爆 |
+| `outbox_flush_interval_seconds` | `60` | 后台重放循环的间隔 |
 | `backfill_on_first_seen` | `true` | 首次接入群聊时拉取历史 |
 | `backfill_max_messages` | `500` | 每群最多拉取历史条数 |
 | `ingest_attachments` | `false` | 是否将图片/文件推送至 OV resources（需 VLM） |
@@ -84,7 +95,39 @@
 
 所有 peer 都挂在同一个 bot self 空间下（`viking://user/<bot>/peers/*`）。默认召回 self + 当前说话人 + 近期活跃成员的画像；因此 A 在群里提问时，bot 也能召回最近活跃的 B、C 的画像（例如「Bob 喜欢什么」）。
 
-> OpenViking 不允许「一次搜全部 peer」，每个要召回的人必须显式点名——本插件通过 `peer_recall_scope` 控制点名范围。这比旧的 fanout 干净：每个人的画像只存一份，不做有损复制。
+召回的取值方式分两档：
+
+- **context 档（默认）**：身份交给服务端解析，插件只传 `peer_scope`。`venue` 隔离下 OV user 就是本群，`all` = 本群所有 peer，正是想要的效果；`global` 下 user 跨群共享，`all` 会扫到别的群的 peer，所以**强制收窄为 `actor`**。若服务端拒绝 `peer_scope`，插件只会收窄到 `actor` 并告警，**绝不会放宽**。
+- **降级档（list / find）**：服务端不提供身份解析，只能像以前那样**逐个显式点名** `target_uri`，点名范围由 `peer_recall_scope` 控制。
+
+这也意味着 `peer_recall_scope` 只影响降级档；context 档看 `recall_peer_scope`。
+
+> `global` 隔离下 `peer_scope` 强制为 `actor`，因此「A 问 Bob 喜欢什么」这类跨人召回会失失。要补回这个能力，把 `recall_include_active_peers` 设为 `true`：插件会在 context 结果之上再发一次**限定在活跃成员自身空间**的排序检索，URI 去重后合并进同一个块。代价是每轮多一次请求；`venue` 隔离下 `peer_scope=all` 已覆盖全部 peer，该项自动跳过。
+
+## 写入可靠性（outbox）
+
+捕获到的消息是插件**无法重建**的东西：唯一副本就是平台侧的场景，一旦丢就真的没了。因此所有捕获写入（文本、图片转写、工具 I/O、历史回填）统一经一个落盘队列：
+
+- 写入失败时先落盘，再于后台按间隔重放；
+- **严格保序**：某 venue 的头一条没送达时，后续消息不会绕过它，否则会话读起来是乱序的、抽取出的记忆也是错的；
+- 只重试“稍后可能成功”的失败（超时 / 408 / 425 / 429 / 5xx / 连接错误）；4xx 这类确定性失败（如凭据错误）直接丢弃并唨 error，否则会永久堵住队列；
+- 每个 venue 有上限、条目有 TTL，长时间故障不会把数据库涨爆；
+- **队列不存凭据**：只存“说了什么”，Bearer 身份在重放时重新解析。
+
+队列深度、已重放数、已丢弃数可在 `/ov_status` 的 `Outbox:` 行看到。
+
+## 可观测性（`/ov_status`）
+
+除了基础状态，`/ov_status` 还会报出这几件原本“黑盒”的事：
+
+| 行 | 含义 |
+|------|------|
+| `Last commit: … [状态, task=…]` | **提交是两阶段的**：归档（Phase 1）在 commit 返回前完成，记忆抽取（Phase 2）在后台跑。状态取值：`archived`（无 task）、`extracting`（已受理，抽取中）、`extracted`（抽取完成）、`extract_failed`（抽取失败，带原因）、`extract_unknown`（任务已过期/丢失）、`commit_failed`（请求就没成功，pending 保留待重试）。因此“提交成功”不再等于“记忆已可检索” |
+| `Recall: … , peer_scope=…, dedup ring=…` | 当前召回档位（context / 降级 / 不可用原因）、生效的 peer 作用域、本会话去重环长度 |
+| `Outbox: N pending …` | 待重放的捕获写入数、已重放数、已丢弃数 |
+| `Context inject: tail (fallbacks=N)` | 注入位置。`tail` = 走 content part（不破坏前缀缓存）；一旦变成 `system_prompt` 就说明回退发生了，prefix cache 命中率会下降，`fallbacks` 为累计次数 |
+
+> 提交状态与任务轮询保存在内存中，进程重启后从空开始（消息本身不会丢——它们在 OV 的 session 里）。
 
 ## 图片转写
 

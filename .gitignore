@@ -11,3 +11,8 @@ venv/
 .mypy_cache/
 .pytest_cache/
 .ruff_cache/
+
+# AstrBot resolves its root from os.getcwd(), so running pytest or a smoke
+# script from this directory materializes a full runtime tree (cmd_config.json
+# with the dashboard credentials, data_v4.db, t2i_templates/, temp/) right here.
+data/

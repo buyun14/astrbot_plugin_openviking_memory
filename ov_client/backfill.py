@@ -9,16 +9,15 @@ from __future__ import annotations
 
 import asyncio
 import json
-import logging
 import time
 from typing import Any, Awaitable, Callable
 
+from ._log import logger
 from .client import PEER_MEMORY_POLICY, OVClient
 from .config import PluginConfig
 from .identity import derive_session_id, safe_peer_id, venue_is_group
+from .outbox import Outbox
 from .parts import build_message, clean_onebot_text, user_text_part
-
-logger = logging.getLogger("astrbot_plugin_openviking_memory")
 
 STALE_RUNNING_SECONDS = 600
 
@@ -31,12 +30,14 @@ class BackfillManager:
         kv_get: Callable[[str, Any], Awaitable[Any]],
         kv_put: Callable[[str, Any], Awaitable[None]],
         kv_prefix: str = "",
+        outbox: Outbox | None = None,
     ):
         self._client = client
         self._cfg = cfg
         self._kv_get = kv_get
         self._kv_put = kv_put
         self._kv_prefix = kv_prefix
+        self._outbox = outbox
         self._running: set[str] = set()
 
     async def maybe_trigger(
@@ -127,7 +128,12 @@ class BackfillManager:
                     ]
                     payload = build_message("user", parts)
                     peer_id = safe_peer_id(sender_id) if self._cfg.peer_enabled else None
-                    await self._client.add_message(session_id, payload, peer_id=peer_id, **auth)
+                    if self._outbox is not None:
+                        # Replayed later if the write fails, so a long backfill is
+                        # not silently truncated by a rate limit partway through.
+                        await self._outbox.send(venue_id, session_id, payload, peer_id=peer_id)
+                    else:
+                        await self._client.add_message(session_id, payload, peer_id=peer_id, **auth)
                     count += 1
 
                 if batch_start + self._cfg.backfill_batch_size < len(messages):

@@ -10,15 +10,21 @@ behind a gateway).
 
 from __future__ import annotations
 
-import logging
 from typing import Any
 from urllib.parse import quote
 
 import httpx
 
-logger = logging.getLogger("astrbot_plugin_openviking_memory")
+from ._log import logger
 
 DEFAULT_TIMEOUT = 15.0
+
+# Context-mode search bounds, mirrored from the server's request model so we
+# clamp locally instead of earning a 422.
+CONTEXT_MIN_TOKENS = 64
+CONTEXT_MAX_TOKENS = 32000
+CONTEXT_MAX_DEDUP_TURNS = 100
+CONTEXT_MAX_EXCLUDE_URIS = 200
 
 # Sent at commit when peer memory is enabled: extract both the bot's own (self)
 # memory and a per-person (peer) profile for each peer_id seen in the batch.
@@ -26,6 +32,92 @@ PEER_MEMORY_POLICY: dict[str, dict[str, bool]] = {
     "self": {"enabled": True},
     "peer": {"enabled": True},
 }
+
+
+class ContextSearchUnsupported(Exception):
+    """The server cannot serve the context face as asked.
+
+    Deterministic: the same request will fail the same way, so callers should
+    fall back to list mode and remember it rather than retry.
+
+    Attributes:
+        field: ``"mode"`` when the context face itself is unavailable,
+            ``"peer_scope"`` when only that argument was rejected. The caller
+            must narrow the scope in the latter case, never widen it.
+        detail: Short server-supplied explanation, for logs.
+    """
+
+    def __init__(self, field: str, detail: str = "") -> None:
+        super().__init__(f"context search unsupported ({field}): {detail}")
+        self.field = field
+        self.detail = detail
+
+
+def _error_message(response: Any) -> str:
+    """Pull the human-readable message out of an OV error envelope."""
+    try:
+        error = response.json().get("error") or {}
+    except Exception:
+        return response.text[:200]
+    if isinstance(error, dict):
+        return str(error.get("message") or error)[:300]
+    return str(error)[:300]
+
+
+def _json_body(response: httpx.Response) -> dict[str, Any] | None:
+    """Decode a JSON object body, tolerating anything the server sends back.
+
+    A 200 whose body is not JSON at all, or is not a JSON object, is a
+    server-side fault rather than a caller error. Returning None lets callers
+    degrade exactly the way they already do for a transport failure, instead of
+    raising into whatever called them: a plugin hook, the background poll loop,
+    or the shutdown path.
+
+    Args:
+        response: The response to decode.
+
+    Returns:
+        The decoded object, or None when the body cannot be decoded or is not
+        an object.
+    """
+    try:
+        body = response.json()
+    except ValueError:
+        # httpx raises JSONDecodeError (a ValueError) for a non-JSON body,
+        # including an empty one or one that is not valid UTF-8.
+        return None
+    return body if isinstance(body, dict) else None
+
+
+def _unsupported_field(response: Any) -> str:
+    """Decide whether a 4xx means "no context face" or "peer_scope rejected"."""
+    message = _error_message(response).lower()
+    if "peer_scope" in message:
+        return "peer_scope"
+    return "mode"
+
+
+def _search_hits(result: Any) -> list[dict[str, Any]]:
+    """Flatten a list-mode search payload into a flat hit list."""
+    if isinstance(result, list):
+        return [item for item in result if isinstance(item, dict)]
+    if not isinstance(result, dict):
+        return []
+    hits: list[dict[str, Any]] = []
+    for bucket in ("memories", "skills"):
+        entries = result.get(bucket)
+        if isinstance(entries, list):
+            hits.extend(item for item in entries if isinstance(item, dict))
+    return hits
+
+
+# Statuses that mean "try again later" rather than "this request is wrong".
+# 408 request timeout, 425 too early, 429 rate limited, 5xx server side.
+RETRYABLE_STATUS = frozenset({408, 425, 429})
+
+
+def _retryable_status(status: int) -> bool:
+    return status in RETRYABLE_STATUS or status >= 500
 
 
 class OVClient:
@@ -96,7 +188,9 @@ class OVClient:
         except Exception as e:
             return None, f"HTTP error: {e}"
         if r.status_code == 200:
-            body = r.json()
+            body = _json_body(r)
+            if body is None:
+                return None, f"HTTP 200 with a non-JSON body: {r.text[:200]}"
             return body.get("result", body), ""
         return None, f"HTTP {r.status_code}: {r.text[:300]}"
 
@@ -110,21 +204,56 @@ class OVClient:
         user_id: str | None = None,
         peer_id: str | None = None,
     ) -> bool:
+        ok, _retryable, _detail = await self.add_message_verbose(
+            session_id, payload, api_key=api_key, user_id=user_id, peer_id=peer_id
+        )
+        return ok
+
+    async def add_message_verbose(
+        self,
+        session_id: str,
+        payload: dict[str, Any],
+        api_key: str | None = None,
+        user_id: str | None = None,
+        peer_id: str | None = None,
+    ) -> tuple[bool, bool, str]:
+        """Append a message, reporting whether a retry could help.
+
+        Transport errors are swallowed and reported as retryable: a hook that
+        raises would take down the message pipeline, and an append that failed
+        on the wire is exactly what the outbox exists to replay.
+
+        Args:
+            session_id: Target OV session.
+            payload: Message body.
+            api_key: Bearer override.
+            user_id: Identity assertion (trusted mode only).
+            peer_id: Stable id of "the other party" (peer contract); set on
+                incoming messages so commit extracts peer memory.
+
+        Returns:
+            ``(delivered, retryable, detail)``. ``retryable`` is only meaningful
+            when ``delivered`` is False.
+        """
         import json as _json
 
-        # peer_id (peer contract) tags the message with the stable id of "the
-        # other party"; set on incoming messages so commit extracts peer memory.
         if peer_id:
             payload = {**payload, "peer_id": peer_id}
         body = _json.dumps(payload, ensure_ascii=False, default=str)
-        r = await self._http.post(
-            f"{self.base_url}/api/v1/sessions/{quote(session_id)}/messages",
-            headers=self._headers(api_key=api_key, user_id=user_id),
-            content=body,
-        )
-        if r.status_code != 200:
-            logger.warning("add_message %s failed: %d", session_id, r.status_code)
-        return r.status_code == 200
+        try:
+            r = await self._http.post(
+                f"{self.base_url}/api/v1/sessions/{quote(session_id)}/messages",
+                headers=self._headers(api_key=api_key, user_id=user_id),
+                content=body,
+            )
+        except httpx.HTTPError as e:
+            return False, True, f"transport error: {type(e).__name__}"
+        if r.status_code == 200:
+            return True, False, ""
+        detail = f"HTTP {r.status_code}: {r.text[:200]}"
+        if _retryable_status(r.status_code):
+            logger.warning("add_message %s failed: HTTP %d", session_id, r.status_code)
+        return False, _retryable_status(r.status_code), detail
 
     async def commit_session(
         self,
@@ -143,7 +272,8 @@ class OVClient:
             json=body,
         )
         if r.status_code == 200:
-            return r.json().get("result")
+            body = _json_body(r)
+            return body.get("result") if body is not None else None
         logger.warning("commit_session %s failed: %d", session_id, r.status_code)
         return None
 
@@ -160,7 +290,48 @@ class OVClient:
             headers=self._headers(api_key=api_key, user_id=user_id),
         )
         if r.status_code == 200:
-            return r.json().get("result")
+            body = _json_body(r)
+            return body.get("result") if body is not None else None
+        return None
+
+    async def get_task(
+        self,
+        task_id: str,
+        api_key: str | None = None,
+        user_id: str | None = None,
+    ) -> dict[str, Any] | None:
+        """Read a background task's progress.
+
+        Commit returns once Phase 1 (archive) is done; memory extraction is
+        Phase 2 and keeps running in the background, so the difference between
+        "accepted" and "actually extracted" is only visible here.
+
+        Args:
+            task_id: Task id returned by commit.
+            api_key: Bearer override.
+            user_id: Identity assertion (trusted mode only).
+
+        Returns:
+            The task object (``status``/``stage``/``error``), a synthetic
+            ``{"status": "gone"}`` when the tracker no longer knows the task
+            (so callers stop polling), or None when the request itself failed.
+        """
+        try:
+            r = await self._http.get(
+                f"{self.base_url}/api/v1/tasks/{quote(task_id)}",
+                headers=self._headers(api_key=api_key, user_id=user_id),
+            )
+        except httpx.HTTPError as e:
+            logger.debug("get_task %s transport error: %s", task_id, type(e).__name__)
+            return None
+        if r.status_code == 200:
+            body = _json_body(r)
+            result = body.get("result") if body is not None else None
+            return result if isinstance(result, dict) else None
+        if r.status_code == 404:
+            # Tasks can expire; treat that as terminal rather than polling forever.
+            return {"status": "gone"}
+        logger.debug("get_task %s failed: %d", task_id, r.status_code)
         return None
 
     # -- search ---------------------------------------------------------------
@@ -188,7 +359,8 @@ class OVClient:
         if r.status_code != 200:
             logger.warning("find failed: %d", r.status_code)
             return []
-        result = r.json().get("result", {})
+        body = _json_body(r)
+        result = body.get("result", {}) if body is not None else {}
         if isinstance(result, list):
             return result
         items: list[dict[str, Any]] = []
@@ -206,40 +378,165 @@ class OVClient:
             headers=self._headers(api_key=api_key, user_id=user_id),
         )
         if r.status_code == 200:
-            user = r.json().get("result", {}).get("user", "")
+            body = _json_body(r)
+            result = body.get("result") if body is not None else None
+            user = result.get("user", "") if isinstance(result, dict) else ""
             if user and isinstance(user, str):
                 return user.strip()
         return "default"
 
-    async def search(
+    async def search_list(
         self,
         query: str,
-        target_uri: str = "",
+        target_uri: str | list[str] = "",
         limit: int = 8,
         min_score: float = 0.35,
         session_id: str = "",
         api_key: str | None = None,
         user_id: str | None = None,
-    ) -> list[dict[str, Any]]:
+    ) -> list[dict[str, Any]] | None:
+        """``POST /search`` in list mode: ranked hits, session-aware.
+
+        List mode keeps ``target_uri`` (so the caller's multi-peer narrowing
+        still works) while accepting ``session_id``. ``read_content`` asks the
+        server to inline each hit's body, which removes one ``content/read``
+        round-trip per hit.
+
+        Returns:
+            Hits with ``uri``/``abstract``/``level``/``content``; an empty list
+            when the server found nothing, or None when the request itself
+            failed (so the caller can try an older endpoint).
+        """
         body: dict[str, Any] = {
             "query": query,
+            "mode": "list",
             "limit": limit,
             "score_threshold": min_score,
+            "read_content": True,
         }
         if target_uri:
             body["target_uri"] = target_uri
         if session_id:
             body["session_id"] = session_id
-        r = await self._http.post(
-            f"{self.base_url}/api/v1/search/search",
-            headers=self._headers(api_key=api_key, user_id=user_id),
-            json=body,
-        )
+        try:
+            r = await self._http.post(
+                f"{self.base_url}/api/v1/search/search",
+                headers=self._headers(api_key=api_key, user_id=user_id),
+                json=body,
+            )
+        except httpx.HTTPError as e:
+            logger.warning("search(list) transport error: %s", type(e).__name__)
+            return None
         if r.status_code == 200:
-            result = r.json().get("result", [])
-            return result if isinstance(result, list) else []
-        logger.warning("search failed: %d", r.status_code)
-        return []
+            body = _json_body(r)
+            if body is None:
+                # Same handling as a transport failure: let the caller fall back
+                # to /find rather than reporting an empty result set.
+                logger.warning("search(list) returned a non-JSON body")
+                return None
+            return _search_hits(body.get("result"))
+        logger.warning("search(list) failed: %d", r.status_code)
+        return None
+
+    async def search_context(
+        self,
+        query: str,
+        session_id: str = "",
+        *,
+        peer_scope: str = "actor",
+        max_tokens: int = 0,
+        dedup_turns: int = 0,
+        query_expansion: str = "auto",
+        rewrite: bool = False,
+        purpose: str = "chat",
+        min_score: float = 0.35,
+        exclude_uris: list[str] | None = None,
+        timeout: float | None = None,
+        api_key: str | None = None,
+        user_id: str | None = None,
+    ) -> dict[str, Any] | None:
+        """``POST /search`` in context mode: server-side assembly.
+
+        Context mode is the only face that runs the cross-turn dedup ledger,
+        query expansion and token budgeting; it takes ``peer_scope`` instead of
+        ``target_uri`` (the server rejects the latter outright).
+
+        Args:
+            query: User query.
+            session_id: The same OV session the capture path writes to; the
+                dedup ledger lives under that session and is skipped without it.
+            peer_scope: ``actor`` (this peer only) or ``all``. Passed explicitly
+                because the server defaults to ``all``.
+            max_tokens: Injection budget; clamped to the server's 64..32000.
+            dedup_turns: Cross-turn cooldown; clamped to 0..100.
+            query_expansion: ``auto`` or ``off``.
+            rewrite: Ask the server for a rewritten digest (slower).
+            purpose: Quota preset, ``chat`` or ``coding``.
+            min_score: Score threshold.
+            exclude_uris: Client-side dedup ring; truncated to the server's 200.
+            timeout: Per-request timeout in seconds (this call may be slow).
+            api_key: Bearer override.
+            user_id: Identity assertion (trusted mode only).
+
+        Returns:
+            ``{entries, rendered, digest, stats}`` on success, or None when the
+            failure looks transient (timeout, connection error, 5xx).
+
+        Raises:
+            ContextSearchUnsupported: The server has no context face, or rejects
+                one of its arguments (deterministic — do not retry).
+        """
+        body: dict[str, Any] = {
+            "query": query,
+            "mode": "context",
+            "peer_scope": peer_scope,
+            "query_expansion": query_expansion,
+            "purpose": purpose,
+            "score_threshold": min_score,
+            "rewrite": rewrite,
+        }
+        if session_id:
+            body["session_id"] = session_id
+        if max_tokens > 0:
+            body["max_tokens"] = max(CONTEXT_MIN_TOKENS, min(max_tokens, CONTEXT_MAX_TOKENS))
+        if dedup_turns > 0:
+            body["dedup_turns"] = max(1, min(dedup_turns, CONTEXT_MAX_DEDUP_TURNS))
+        if exclude_uris:
+            body["exclude_uris"] = list(exclude_uris)[:CONTEXT_MAX_EXCLUDE_URIS]
+
+        kwargs: dict[str, Any] = {}
+        if timeout is not None:
+            kwargs["timeout"] = timeout
+        try:
+            r = await self._http.post(
+                f"{self.base_url}/api/v1/search/search",
+                headers=self._headers(api_key=api_key, user_id=user_id),
+                json=body,
+                **kwargs,
+            )
+        except httpx.TimeoutException:
+            logger.warning("search(context) timed out after %ss", timeout)
+            return None
+        except httpx.HTTPError as e:
+            logger.warning("search(context) transport error: %s", type(e).__name__)
+            return None
+
+        if r.status_code == 200:
+            body = _json_body(r)
+            if body is None:
+                logger.warning("search(context) returned a non-JSON body")
+                return None
+            result = body.get("result")
+            return result if isinstance(result, dict) else None
+        if r.status_code in (404, 405):
+            # A server old enough to have no /search at all.
+            raise ContextSearchUnsupported("mode", f"HTTP {r.status_code}")
+        if r.status_code >= 500:
+            logger.warning("search(context) server error: %d", r.status_code)
+            return None
+        # 400/422: the request itself is wrong. Split "old server" from
+        # "peer_scope rejected" so the caller can degrade only the former.
+        raise ContextSearchUnsupported(_unsupported_field(r), _error_message(r))
 
     async def read_content(
         self,
@@ -253,7 +550,8 @@ class OVClient:
             headers=self._headers(api_key=api_key, user_id=user_id),
         )
         if r.status_code == 200:
-            result = r.json().get("result")
+            body = _json_body(r)
+            result = body.get("result") if body is not None else None
             return result if isinstance(result, str) else None
         return None
 
@@ -273,6 +571,7 @@ class OVClient:
             json={"path": path, "to": to_uri, "wait": wait},
         )
         if r.status_code == 200:
-            return r.json().get("result")
+            body = _json_body(r)
+            return body.get("result") if body is not None else None
         logger.warning("add_resource failed: %d", r.status_code)
         return None

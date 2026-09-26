@@ -14,13 +14,13 @@ viking://user/<bot>/peers/<sender_id>/.
 from __future__ import annotations
 
 import asyncio
-import logging
+import json
 from typing import Any
 
 from astrbot.api import AstrBotConfig
 from astrbot.api.event import AstrMessageEvent, filter
 from astrbot.api.event.filter import EventMessageType, PermissionType
-from astrbot.api.star import Context, Star, register
+from astrbot.api.star import Context, Star
 
 from .ov_client.backfill import BackfillManager
 from .ov_client.client import OVClient
@@ -34,6 +34,8 @@ from .ov_client.identity import (
     safe_peer_id,
     venue_is_group,
 )
+from .ov_client.injection import inject_recall_block, injection_fallback_count
+from .ov_client.outbox import Outbox
 from .ov_client.parts import (
     assistant_text_part,
     build_message,
@@ -48,19 +50,15 @@ from .ov_client.parts import (
 )
 from .ov_client.presence import PresenceTracker
 from .ov_client.recall import recall_and_format
+from .ov_client.recall_ledger import RecallLedger
 
 
-@register(
-    "astrbot_plugin_openviking_memory",
-    "tosaki",
-    "OpenViking Memory Plugin",
-    "0.2.0",
-    "https://github.com/t0saki/astrbot_plugin_openviking_memory",
-)
 class OpenVikingMemoryPlugin(Star):
     def __init__(self, context: Context, config: AstrBotConfig) -> None:
         super().__init__(context)
-        self.logger = logging.getLogger("astrbot")
+        # ``Star.__init__`` already installs this plugin's dedicated logger
+        # (``astrbot.plugin.<plugin_name>``); re-pointing it at the global
+        # "astrbot" logger would defeat the per-plugin log level in the WebUI.
         raw_config = dict(config) if config else {}
         self.cfg = PluginConfig(raw_config)
 
@@ -85,16 +83,33 @@ class OpenVikingMemoryPlugin(Star):
             window=self.cfg.peer_recall_active_window,
             ttl_seconds=float(self.cfg.commit_idle_seconds),
         )
+        # venue_id -> (api_key, fallback_user_id). fallback_user_id is only used
+        # for X-OpenViking-User assertion in trusted_mode.
+        self._venue_auth: dict[str, tuple[str, str]] = {}
+        self.outbox = Outbox(
+            kv_get=self._kv_get,
+            kv_put=self._kv_put,
+            client=self.ov,
+            prefix=self._kv_prefix,
+            auth_resolver=self._auth,
+            on_delivered=self._on_outbox_delivered,
+            max_pending=self.cfg.outbox_max_pending,
+            ttl_seconds=self.cfg.outbox_ttl_hours * 3600,
+        )
+        self._drainer: asyncio.Task | None = None
         self.backfill = BackfillManager(
             self.ov,
             self.cfg,
             kv_get=self._kv_get,
             kv_put=self._kv_put,
             kv_prefix=self._kv_prefix,
+            outbox=self.outbox,
         )
-        # venue_id -> (api_key, fallback_user_id). fallback_user_id is only used
-        # for X-OpenViking-User assertion in trusted_mode.
-        self._venue_auth: dict[str, tuple[str, str]] = {}
+        self.recall_ledger = RecallLedger(
+            kv_get=self._kv_get,
+            kv_put=self._kv_put,
+            prefix=self._kv_prefix,
+        )
 
     async def _kv_get(self, key: str, default: Any = None) -> Any:
         return await self.get_kv_data(key, default)
@@ -178,10 +193,92 @@ class OpenVikingMemoryPlugin(Star):
     def _peer_id_for(self, sender_id: str) -> str | None:
         return safe_peer_id(sender_id) if self.cfg.peer_enabled else None
 
+    # -- capture writes -------------------------------------------------------
+
+    async def _capture(
+        self,
+        venue_id: str,
+        session_id: str,
+        message: dict[str, Any],
+        *,
+        peer_id: str | None = None,
+    ) -> bool:
+        """Write one capture message, queueing it when OV cannot take it now.
+
+        Returns:
+            True when the message is in OV; False when it is queued for replay
+            or was rejected outright.
+        """
+        self._ensure_drainer()
+        if not self.cfg.outbox_enabled:
+            return await self.ov.add_message(
+                session_id, message, peer_id=peer_id, **self._auth(venue_id)
+            )
+        return await self.outbox.send(venue_id, session_id, message, peer_id=peer_id)
+
+    async def _capture_message(
+        self,
+        venue_id: str,
+        session_id: str,
+        message: dict[str, Any],
+        *,
+        text: str,
+        peer_id: str | None = None,
+    ) -> bool:
+        """Capture a message and, only if it reached OV, count it toward a commit.
+
+        Delivery and accounting are kept in one place on purpose: a queued or
+        rejected write must not advance the commit counters, or the session would
+        be committed while it is still missing those messages. Replayed writes are
+        counted once they land, in ``_on_outbox_delivered``.
+        """
+        ok = await self._capture(venue_id, session_id, message, peer_id=peer_id)
+        if ok:
+            self.scheduler.set_auth(session_id, self._auth(venue_id))
+            await self.scheduler.record_message(session_id, estimate_tokens(text))
+        return ok
+
+    async def _on_outbox_delivered(
+        self, venue_id: str, session_id: str, message: dict[str, Any]
+    ) -> None:
+        """Count a replayed write, so a queue that drained still commits."""
+        self.scheduler.set_auth(session_id, self._auth(venue_id))
+        await self.scheduler.record_message(session_id, estimate_tokens(_message_text(message)))
+
+    def _ensure_drainer(self) -> None:
+        """Start the background loop if it is not running yet.
+
+        Called from the capture path, from ``on_astrbot_loaded`` and from the LLM
+        request hook. The last one matters because ``on_astrbot_loaded`` does not
+        fire again on a hot reload, and because the loop also polls commit tasks —
+        which is needed whether or not the outbox is enabled.
+        """
+        if self._drainer is not None and not self._drainer.done():
+            return
+        self._drainer = asyncio.create_task(self._drain_loop())
+
+    async def _drain_loop(self) -> None:
+        interval = max(5, int(self.cfg.outbox_flush_interval_seconds))
+        while True:
+            await asyncio.sleep(interval)
+            try:
+                # Always polled: a commit only reports that archiving finished, so
+                # extraction is observable only through the task API. That has
+                # nothing to do with whether the outbox is switched on.
+                await self.scheduler.poll_commit_tasks()
+                if self.cfg.outbox_enabled:
+                    await self.outbox.flush_all()
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                self.logger.exception("[OV] background drain failed")
+
     # -- hook: on_astrbot_loaded ----------------------------------------------
 
     @filter.on_astrbot_loaded()
     async def on_loaded(self):
+        await self.outbox.load()
+        self._ensure_drainer()
         ok = await self.ov.health()
         if ok:
             self.logger.info(
@@ -236,20 +333,19 @@ class OpenVikingMemoryPlugin(Star):
             ]
             if msg_chain:
                 self._append_media_placeholders(msg_chain, parts)
-            ok = await self.ov.add_message(
-                session_id, build_message("user", parts), peer_id=peer_id, **auth
+            await self._capture_message(
+                venue_id,
+                session_id,
+                build_message("user", parts),
+                text=info["text"],
+                peer_id=peer_id,
             )
-            if ok:
-                self.scheduler.set_auth(session_id, auth)
-                await self.scheduler.record_message(session_id, estimate_tokens(info["text"]))
-            else:
-                self.logger.warning("[OV] add_message failed for %s", session_id)
 
         # Actively transcribe every image (not just bot-directed ones) in the
         # background so the VLM call doesn't block message handling.
         if images:
             asyncio.create_task(
-                self._caption_images(images, session_id, auth, peer_id, info, is_group)
+                self._caption_images(images, venue_id, session_id, peer_id, info, is_group)
             )
 
         await self.backfill.maybe_trigger(
@@ -291,7 +387,7 @@ class OpenVikingMemoryPlugin(Star):
             or "请用中文描述这张图片，尽量包含其中的文字内容。"
         )
 
-    async def _caption_images(self, images, session_id, auth, peer_id, info, is_group):
+    async def _caption_images(self, images, venue_id, session_id, peer_id, info, is_group):
         provider = self._image_caption_provider()
         if provider is None:
             return
@@ -309,11 +405,9 @@ class OpenVikingMemoryPlugin(Star):
             part = image_caption_part(
                 cap, info["sender_name"], info["sender_id"], is_group, info["group_id"]
             )
-            if await self.ov.add_message(
-                session_id, build_message("user", [part]), peer_id=peer_id, **auth
-            ):
-                self.scheduler.set_auth(session_id, auth)
-                await self.scheduler.record_message(session_id, estimate_tokens(cap))
+            await self._capture_message(
+                venue_id, session_id, build_message("user", [part]), text=cap, peer_id=peer_id
+            )
 
     def _append_media_placeholders(self, msg_chain: Any, parts: list):
         chain = getattr(msg_chain, "message", None) or []
@@ -344,6 +438,10 @@ class OpenVikingMemoryPlugin(Star):
         auth = self._auth(venue_id)
         session_id = derive_session_id(venue_id)
         peer_id = self._peer_id_for(info["sender_id"])
+        # Every turn is a chance to (re)start the background loop: on_astrbot_loaded
+        # does not fire on a hot reload, and the loop also polls commit tasks, so it
+        # must not depend on a capture write happening first.
+        self._ensure_drainer()
 
         # AstrBot turns images into a <image_caption>…</image_caption> text part on
         # the request (req built before this hook fires). Image-only messages have
@@ -357,16 +455,19 @@ class OpenVikingMemoryPlugin(Star):
                 part = image_caption_part(
                     cap, info["sender_name"], info["sender_id"], is_group, info["group_id"]
                 )
-                if await self.ov.add_message(
-                    session_id, build_message("user", [part]), peer_id=peer_id, **auth
-                ):
-                    self.scheduler.set_auth(session_id, auth)
-                    await self.scheduler.record_message(session_id, estimate_tokens(cap))
+                await self._capture_message(
+                    venue_id,
+                    session_id,
+                    build_message("user", [part]),
+                    text=cap,
+                    peer_id=peer_id,
+                )
 
         if not self.cfg.auto_recall_enabled or not info["text"].strip():
             return
 
         active = self.presence.active(venue_id, exclude=peer_id)
+        await self.recall_ledger.load()
         block = await recall_and_format(
             self.ov,
             self.cfg,
@@ -375,10 +476,13 @@ class OpenVikingMemoryPlugin(Star):
             ov_user_id,
             speaker_id=info["sender_id"],
             active_member_ids=active,
+            session_id=session_id,
+            self_scope=get_effective_self_scope(self.cfg, info["group_id"]),
+            ledger=self.recall_ledger,
             **auth,
         )
         if block:
-            req.system_prompt = (req.system_prompt or "") + "\n\n" + block
+            inject_recall_block(req, block)
 
     # -- hook: capture LLM response -------------------------------------------
 
@@ -402,12 +506,10 @@ class OpenVikingMemoryPlugin(Star):
             return
 
         # The bot's own reply is the session owner (self) — no peer_id.
-        auth = self._auth(venue_id)
         session_id = derive_session_id(venue_id)
         parts = [assistant_text_part(reply_text)]
         payload = build_message("assistant", parts)
-        await self.ov.add_message(session_id, payload, **auth)
-        await self.scheduler.record_message(session_id, estimate_tokens(reply_text))
+        await self._capture_message(venue_id, session_id, payload, text=reply_text)
 
     # -- hook: tool I/O capture -----------------------------------------------
 
@@ -425,10 +527,11 @@ class OpenVikingMemoryPlugin(Star):
         t_name = _tool_name(tool)
         if not t_name:
             return
-        auth = self._auth(venue_id)
         session_id = derive_session_id(venue_id)
         payload = build_message("assistant", [tool_call_part(t_name, tool_args)])
-        await self.ov.add_message(session_id, payload, **auth)
+        # Tool traffic is part of the session: it has to be counted too, or a
+        # tool-heavy turn never reaches the commit thresholds.
+        await self._capture_message(venue_id, session_id, payload, text=f"{t_name} {tool_args}")
 
     @filter.on_llm_tool_respond()
     async def on_tool_respond(self, event: AstrMessageEvent, *args, **kwargs):
@@ -444,12 +547,11 @@ class OpenVikingMemoryPlugin(Star):
         t_name = _tool_name(tool)
         if not t_name:
             return
-        auth = self._auth(venue_id)
         session_id = derive_session_id(venue_id)
-        payload = build_message(
-            "assistant", [tool_result_part(t_name, _tool_result_text(tool_result))]
-        )
-        await self.ov.add_message(session_id, payload, **auth)
+        result_text = _tool_result_text(tool_result)
+        payload = build_message("assistant", [tool_result_part(t_name, result_text)])
+        # Counted for the same reason as the tool-call part above.
+        await self._capture_message(venue_id, session_id, payload, text=result_text)
 
     # -- hook: after message sent → commit eval -------------------------------
 
@@ -488,6 +590,38 @@ class OpenVikingMemoryPlugin(Star):
 
         peer_status = f"on ({self.cfg.peer_recall_scope})" if self.cfg.peer_enabled else "off"
 
+        await self.recall_ledger.load()
+        snap = self.recall_ledger.snapshot()
+        effective_scope = self.recall_ledger.resolve_peer_scope(
+            self.cfg.recall_peer_scope, self_scope=scope
+        )
+        if not self.cfg.recall_context_enabled:
+            recall_status = "ranked only (recall_context_enabled=false)"
+        elif snap["context_face"] == "unsupported":
+            recall_status = (
+                f"context unavailable ({snap['context_face_reason'] or 'server refused'})"
+            )
+        else:
+            recall_status = "context"
+        recalled_uris = await self.recall_ledger.ring_size(session_id)
+        outbox_snap = self.outbox.snapshot()
+        outbox_pending = outbox_snap["venues"].get(venue_id, 0)
+        commit_line = f"Last commit: {_fmt_ts(sched['last_commit_ts'])}"
+        if sched["commit_state"]:
+            task = sched["extract_task_id"]
+            detail = sched["commit_detail"]
+            commit_line += f" [{sched['commit_state']}"
+            if task:
+                commit_line += f", task={task[:8]}"
+            if detail:
+                commit_line += f", {detail[:60]}"
+            commit_line += "]"
+        supplement = ""
+        if self.cfg.recall_include_active_peers and effective_scope == "actor":
+            supplement = ", active-peer supplement=on"
+        elif self.cfg.recall_include_active_peers:
+            supplement = ", active-peer supplement=redundant (peer_scope=all)"
+
         lines = [
             "OpenViking Memory Plugin v0.2.0",
             f"Server: {self.cfg.ov_base_url} ({'OK' if healthy else 'UNREACHABLE'})",
@@ -498,8 +632,14 @@ class OpenVikingMemoryPlugin(Star):
             f"Peer memory: {peer_status}",
             f"Venue: {venue_id}",
             f"Pending: {sched['pending_messages']} msgs / ~{sched['pending_tokens']} tokens",
-            f"Last commit: {_fmt_ts(sched['last_commit_ts'])}",
+            commit_line,
             f"Backfill: {bf_status}",
+            f"Context inject: {'tail' if injection_fallback_count() == 0 else 'system_prompt'}"
+            f" (fallbacks={injection_fallback_count()})",
+            f"Recall: {recall_status}, peer_scope={effective_scope}, "
+            f"dedup ring={recalled_uris}{supplement}",
+            f"Outbox: {outbox_pending} pending (all venues: {sum(outbox_snap['venues'].values())}, "
+            f"sent={outbox_snap['sent']}, dropped={outbox_snap['dropped']})",
             f"Active peers: {len(self.presence.active(venue_id))}",
             f"Venues: {len(self._venue_auth)}",
         ]
@@ -528,6 +668,19 @@ class OpenVikingMemoryPlugin(Star):
     # -- lifecycle ------------------------------------------------------------
 
     async def terminate(self):
+        if self._drainer is not None and not self._drainer.done():
+            self._drainer.cancel()
+            try:
+                await self._drainer
+            except asyncio.CancelledError:
+                pass
+            except Exception:
+                self.logger.exception("[OV] outbox drainer stopped with an error")
+        # Last chance to empty the outbox before the HTTP client goes away.
+        try:
+            await self.outbox.flush_all()
+        except Exception:
+            self.logger.exception("[OV] outbox flush on shutdown failed")
         await self.scheduler.flush_all()
         await self.ov.close()
         self.logger.info("[OV] plugin terminated, all sessions flushed")
@@ -563,6 +716,25 @@ def _tool_result_text(result: Any) -> str:
         texts.append(t if t else (b if isinstance(b, str) else str(b)))
     joined = "\n".join(s for s in texts if s)
     return joined or str(result)
+
+
+def _message_text(payload: dict) -> str:
+    """Best-effort text of a captured message, for token accounting on replay."""
+    content = payload.get("content")
+    if isinstance(content, str):
+        return content
+    chunks: list[str] = []
+    for part in payload.get("parts") or []:
+        if not isinstance(part, dict):
+            continue
+        for key in ("text", "tool_output"):
+            value = part.get(key)
+            if isinstance(value, str):
+                chunks.append(value)
+        tool_input = part.get("tool_input")
+        if isinstance(tool_input, dict):
+            chunks.append(json.dumps(tool_input, ensure_ascii=False, default=str))
+    return " ".join(chunks)
 
 
 def _extract_image_captions(req: Any) -> list[str]:

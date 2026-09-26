@@ -9,12 +9,11 @@ from the Bearer key, X-OpenViking-* headers are sent only in trusted_mode.
 
 from __future__ import annotations
 
-import logging
 import os
 import re
 from typing import Any
 
-logger = logging.getLogger("astrbot_plugin_openviking_memory")
+from ._log import logger
 
 _DEFAULTS: dict[str, Any] = {
     "ov_base_url": "http://localhost:1933",
@@ -32,9 +31,20 @@ _DEFAULTS: dict[str, Any] = {
     "recall_limit": 8,
     "recall_min_score": 0.35,
     "recall_token_budget": 2000,
+    "recall_context_enabled": True,
+    "recall_dedup_turns": 3,
+    "recall_peer_scope": "auto",
+    "recall_query_expansion": True,
+    "recall_rewrite": False,
+    "recall_timeout_ms": 12000,
+    "recall_include_active_peers": False,
     "commit_message_threshold": 20,
     "commit_token_threshold": 4096,
     "commit_idle_seconds": 1800,
+    "outbox_enabled": True,
+    "outbox_max_pending": 200,
+    "outbox_ttl_hours": 24,
+    "outbox_flush_interval_seconds": 60,
     "ingest_attachments": False,
     "capture_tool_io": True,
     "capture_image_caption": True,

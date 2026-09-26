@@ -12,7 +12,7 @@ Auto-captures conversations and performs semantic recall on every LLM request. B
 - **Peer profiles**: Incoming group messages carry a `peer_id` (the sender); on commit OV builds a per-person profile under `viking://user/<bot>/peers/<sender_id>/`. The bot's own replies and tool I/O stay "self".
 - **Structured tool calls**: Tool calls and results are recorded as standalone `tool` parts (`tool_name`/`tool_input`/`tool_status`), not folded into text, so the server can process them separately.
 - **Image transcription**: Optionally transcribe images to text via a vision provider (see [Image transcription](#image-transcription)).
-- **Auto-recall**: Before each LLM request, the plugin recalls self (bot/group context) + the current speaker + recently-active members and appends them to the system prompt.
+- **Auto-recall**: Before each LLM request, the plugin recalls self (bot/group context) + the current speaker + recently-active members and appends them as a provider-only content part at the **tail** of the current user message (never the system prompt, which would invalidate the provider's prefix cache for the whole history).
 - **Auto-commit**: Sessions are committed (archived + memory extracted) based on message count, token threshold, or idle timeout.
 - **Backfill**: On first encounter with a group, historical messages are pulled from the platform and ingested into OV.
 
@@ -49,10 +49,21 @@ All fields are configured via AstrBot WebUI after installation.
 | `auto_recall_enabled` | `true` | Auto-recall on every LLM request |
 | `recall_limit` | `8` | Max recalled entries |
 | `recall_min_score` | `0.35` | Minimum semantic score |
-| `recall_token_budget` | `2000` | Max tokens for injected context |
+| `recall_token_budget` | `2000` | Max tokens for injected context (also sent as the context-mode `max_tokens` budget) |
+| `recall_context_enabled` | `true` | Use server-side context assembly (cross-turn dedup + query expansion + budgeting). Turn off to fall back to plain ranked search |
+| `recall_dedup_turns` | `3` | Do not re-inject a memory served within this many turns (context mode only); use `1` in busy group chats |
+| `recall_peer_scope` | `auto` | Which peers the context face may read: `auto` (`all` under `venue`, `actor` under `global`) / `actor` / `all`. ⚠️ `all` only takes effect under `venue` isolation: under `global` every venue shares one OV user, so `all` would scan other venues' peers and is always narrowed to `actor` (use `recall_include_active_peers` for cross-person recall) |
+| `recall_query_expansion` | `true` | Let the server expand the query before searching (helps with abbreviations; adds latency) |
+| `recall_rewrite` | `false` | Ask for a rewritten digest instead of raw entries; noticeably slower, so raise `recall_timeout_ms` if enabled |
+| `recall_timeout_ms` | `12000` | Give up on a recall request after this long and inject nothing (ms) |
+| `recall_include_active_peers` | `false` | When the context face can only see the current speaker (`peer_scope=actor`), add one ranked search over the recently-active members' own spaces |
 | `commit_message_threshold` | `20` | Auto-commit after N messages |
 | `commit_token_threshold` | `4096` | Auto-commit when tokens exceed this |
 | `commit_idle_seconds` | `1800` | Auto-commit after N seconds idle (also the "recent" window for peer recall) |
+| `outbox_enabled` | `true` | Persist capture writes OpenViking could not accept (rate limits, restarts) and replay them in order instead of losing the messages |
+| `outbox_max_pending` | `200` | Per-venue cap on queued messages; the oldest are dropped once exceeded |
+| `outbox_ttl_hours` | `24` | Discard queued messages older than this, so a long outage cannot grow the queue forever |
+| `outbox_flush_interval_seconds` | `60` | How often the background drainer retries queued messages |
 | `backfill_on_first_seen` | `true` | Pull history on first group encounter |
 | `backfill_max_messages` | `500` | Max messages to backfill |
 | `ingest_attachments` | `false` | Push images/files to OV resources |
@@ -77,7 +88,39 @@ The model is **one bot "self" + one "peer" per person**. `self_scope` controls t
 
 All peers live under the same bot-self space (`viking://user/<bot>/peers/*`). Recall by default pulls self + the current speaker + recently-active members, so when A asks something the bot can also recall B's and C's profiles (e.g. "what does Bob like?").
 
-> OpenViking does not allow searching *all* peers at once — each recalled person must be named explicitly, which `peer_recall_scope` controls. This is cleaner than the old fanout: each person's profile is stored once, with no lossy copying.
+How the peer set is selected depends on the tier in use:
+
+- **Context tier (default)**: the server resolves identity from the caller, so the plugin only passes `peer_scope`. Under `venue` scope the OV user *is* the group and `all` means "the people in this group"; under `global` the user is shared across groups, where `all` would reach other groups' peers, so it is forced down to `actor`. If the server rejects `peer_scope`, the plugin only ever narrows to `actor` (with a warning) — it never widens.
+- **Degraded tier (list / find)**: no server-side identity resolution, so peers must still be named explicitly as `target_uri`, with `peer_recall_scope` controlling the range.
+
+In other words `peer_recall_scope` only affects the degraded tier; the context tier reads `recall_peer_scope`.
+
+> Under `global` scope `peer_scope` is forced down to `actor`, which costs cross-person recall ("what does Bob like?" asked by A). Set `recall_include_active_peers` to `true` to get it back: the plugin then runs one extra ranked search **scoped to the active members' own spaces** and merges it into the same block after URI dedup. The cost is one extra request per turn; under `venue` scope, where `peer_scope=all` already covers every peer, the supplement is skipped automatically.
+
+## Write durability (outbox)
+
+Captured messages are the one thing this plugin cannot re-derive: the bot's transcript is the only copy, so a lost message is lost for good. Every capture write (text, image transcripts, tool I/O, history backfill) therefore goes through a persisted queue:
+
+- a failed write is stored and retried by a background drainer;
+- **order is preserved**: while a venue's head message is undelivered, later ones do not overtake it — otherwise the session reads out of order and the extracted memory is wrong;
+- only failures that can succeed later are retried (timeouts, 408/425/429/5xx, connection errors). Deterministic 4xx failures are dropped with an error log, since retrying them would block the queue forever;
+- each venue's queue is bounded and entries expire, so a long outage cannot grow the database without limit;
+- **credentials are never stored** — the queue holds only what was said, and the Bearer identity is resolved again at replay time.
+
+Queue depth, replayed count and dropped count are shown on the `Outbox:` line of `/ov_status`.
+
+## Observability (`/ov_status`)
+
+Beyond the basics, `/ov_status` reports the things that used to be a black box:
+
+| Line | Meaning |
+|------|---------|
+| `Last commit: … [state, task=…]` | **Commit is two-phase**: archiving (Phase 1) finishes before the call returns, memory extraction (Phase 2) keeps running in the background. States: `archived` (no task), `extracting` (accepted, still running), `extracted`, `extract_failed` (with reason), `extract_unknown` (task expired/gone), `commit_failed` (the request itself failed and pending work was kept for the next try). "Committed" therefore no longer implies "retrievable" |
+| `Recall: …, peer_scope=…, dedup ring=…` | Active recall tier (context / degraded / reason it is unavailable), effective peer scope, and the size of this session's dedup ring |
+| `Outbox: N pending …` | Queued capture writes, replayed count, dropped count |
+| `Context inject: tail (fallbacks=N)` | Where the recall block went. `tail` means a content part, which keeps the prefix cache intact; a switch to `system_prompt` means the fallback fired and cache hits will drop, with the running total in `fallbacks` |
+
+> Commit states and task polling live in memory and start empty after a restart (the messages themselves are safe — they are in the OV session).
 
 ## Image transcription
 
