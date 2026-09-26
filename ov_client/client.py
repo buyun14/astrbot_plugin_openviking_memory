@@ -265,6 +265,45 @@ class OVClient:
             return r.json().get("result")
         return None
 
+    async def get_task(
+        self,
+        task_id: str,
+        api_key: str | None = None,
+        user_id: str | None = None,
+    ) -> dict[str, Any] | None:
+        """Read a background task's progress.
+
+        Commit returns once Phase 1 (archive) is done; memory extraction is
+        Phase 2 and keeps running in the background, so the difference between
+        "accepted" and "actually extracted" is only visible here.
+
+        Args:
+            task_id: Task id returned by commit.
+            api_key: Bearer override.
+            user_id: Identity assertion (trusted mode only).
+
+        Returns:
+            The task object (``status``/``stage``/``error``), a synthetic
+            ``{"status": "gone"}`` when the tracker no longer knows the task
+            (so callers stop polling), or None when the request itself failed.
+        """
+        try:
+            r = await self._http.get(
+                f"{self.base_url}/api/v1/tasks/{quote(task_id)}",
+                headers=self._headers(api_key=api_key, user_id=user_id),
+            )
+        except httpx.HTTPError as e:
+            logger.debug("get_task %s transport error: %s", task_id, type(e).__name__)
+            return None
+        if r.status_code == 200:
+            result = r.json().get("result")
+            return result if isinstance(result, dict) else None
+        if r.status_code == 404:
+            # Tasks can expire; treat that as terminal rather than polling forever.
+            return {"status": "gone"}
+        logger.debug("get_task %s failed: %d", task_id, r.status_code)
+        return None
+
     # -- search ---------------------------------------------------------------
 
     async def find(

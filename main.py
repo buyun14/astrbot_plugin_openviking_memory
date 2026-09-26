@@ -33,7 +33,7 @@ from .ov_client.identity import (
     safe_peer_id,
     venue_is_group,
 )
-from .ov_client.injection import inject_recall_block
+from .ov_client.injection import inject_recall_block, injection_fallback_count
 from .ov_client.outbox import Outbox
 from .ov_client.parts import (
     assistant_text_part,
@@ -231,6 +231,9 @@ class OpenVikingMemoryPlugin(Star):
             await asyncio.sleep(interval)
             try:
                 await self.outbox.flush_all()
+                # Same cadence: a commit only reports that archiving finished, so
+                # extraction has to be polled to be observable at all.
+                await self.scheduler.poll_commit_tasks()
             except asyncio.CancelledError:
                 raise
             except Exception:
@@ -575,6 +578,16 @@ class OpenVikingMemoryPlugin(Star):
         recalled_uris = snap["rings"].get(session_id, 0)
         outbox_snap = self.outbox.snapshot()
         outbox_pending = outbox_snap["venues"].get(venue_id, 0)
+        commit_line = f"Last commit: {_fmt_ts(sched['last_commit_ts'])}"
+        if sched["commit_state"]:
+            task = sched["extract_task_id"]
+            detail = sched["commit_detail"]
+            commit_line += f" [{sched['commit_state']}"
+            if task:
+                commit_line += f", task={task[:8]}"
+            if detail:
+                commit_line += f", {detail[:60]}"
+            commit_line += "]"
         supplement = ""
         if self.cfg.recall_include_active_peers and effective_scope == "actor":
             supplement = ", active-peer supplement=on"
@@ -591,8 +604,10 @@ class OpenVikingMemoryPlugin(Star):
             f"Peer memory: {peer_status}",
             f"Venue: {venue_id}",
             f"Pending: {sched['pending_messages']} msgs / ~{sched['pending_tokens']} tokens",
-            f"Last commit: {_fmt_ts(sched['last_commit_ts'])}",
+            commit_line,
             f"Backfill: {bf_status}",
+            f"Context inject: {'tail' if injection_fallback_count() == 0 else 'system_prompt'}"
+            f" (fallbacks={injection_fallback_count()})",
             f"Recall: {recall_status}, peer_scope={effective_scope}, "
             f"dedup ring={recalled_uris}{supplement}",
             f"Outbox: {outbox_pending} pending (all venues: {sum(outbox_snap['venues'].values())}, "

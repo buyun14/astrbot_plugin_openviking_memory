@@ -121,6 +121,19 @@ Captured messages are the one thing this plugin cannot re-derive: the bot's tran
 
 Queue depth, replayed count and dropped count are shown on the `Outbox:` line of `/ov_status`.
 
+## Observability (`/ov_status`)
+
+Beyond the basics, `/ov_status` reports the things that used to be a black box:
+
+| Line | Meaning |
+|------|---------|
+| `Last commit: … [state, task=…]` | **Commit is two-phase**: archiving (Phase 1) finishes before the call returns, memory extraction (Phase 2) keeps running in the background. States: `archived` (no task), `extracting` (accepted, still running), `extracted`, `extract_failed` (with reason), `extract_unknown` (task expired/gone), `commit_failed` (the request itself failed and pending work was kept for the next try). "Committed" therefore no longer implies "retrievable" |
+| `Recall: …, peer_scope=…, dedup ring=…` | Active recall tier (context / degraded / reason it is unavailable), effective peer scope, and the size of this session's dedup ring |
+| `Outbox: N pending …` | Queued capture writes, replayed count, dropped count |
+| `Context inject: tail (fallbacks=N)` | Where the recall block went. `tail` means a content part, which keeps the prefix cache intact; a switch to `system_prompt` means the fallback fired and cache hits will drop, with the running total in `fallbacks` |
+
+> Commit states and task polling live in memory and start empty after a restart (the messages themselves are safe — they are in the OV session).
+
 ## Image transcription
 
 Two ways to turn image content into text memory:

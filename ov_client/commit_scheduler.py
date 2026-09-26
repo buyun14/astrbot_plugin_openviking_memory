@@ -31,6 +31,19 @@ class SessionState:
     last_commit_ts: float = 0.0
     committing: bool = False
     idle_handle: asyncio.TimerHandle | None = None
+    # Commit is two-phase server side: archiving finishes before the call
+    # returns, memory extraction keeps running and is only observable through
+    # the task API. Keeping both apart is what tells "accepted" from "extracted".
+    commit_state: str = ""
+    commit_detail: str = ""
+    extract_task_id: str = ""
+
+
+# States a commit task cannot leave, so polling can stop.
+TERMINAL_COMMIT_STATES = {"extracted", "extract_failed", "extract_unknown"}
+
+# Task statuses that mean "still working".
+PENDING_TASK_STATUSES = {"", "pending", "running", "cancelling"}
 
 
 class CommitScheduler:
@@ -117,10 +130,68 @@ class CommitScheduler:
                 state.pending_messages = 0
                 state.pending_tokens = 0
                 state.last_commit_ts = time.time()
-        except Exception:
+                task_id = ""
+                if isinstance(result, dict):
+                    task_id = str(result.get("task_id") or "")
+                state.extract_task_id = task_id
+                # Archive done; extraction is a background task now.
+                state.commit_state = "extracting" if task_id else "archived"
+                state.commit_detail = ""
+            else:
+                state.commit_state = "commit_failed"
+                state.commit_detail = "commit request failed"
+                logger.warning(
+                    "commit rejected for session %s; pending kept for the next try",
+                    session_id,
+                )
+        except Exception as exc:
+            state.commit_state = "commit_failed"
+            state.commit_detail = f"{type(exc).__name__}"
             logger.exception("commit failed for session %s", session_id)
         finally:
             state.committing = False
+
+    async def poll_commit_tasks(self) -> int:
+        """Refresh the extraction state of recent commits.
+
+        A successful commit only means the archive phase finished. Whether the
+        memories were actually extracted shows up on the task, so without this
+        the plugin would report "committed" forever and the operator could never
+        tell the two apart.
+
+        Returns:
+            How many sessions changed state.
+        """
+        changed = 0
+        for session_id, state in list(self._sessions.items()):
+            if not state.extract_task_id or state.commit_state in TERMINAL_COMMIT_STATES:
+                continue
+            task = await self._client.get_task(
+                state.extract_task_id, **self._auth.get(session_id, {})
+            )
+            if not isinstance(task, dict):
+                continue
+            status = str(task.get("status") or "")
+            if status in PENDING_TASK_STATUSES:
+                continue
+            if status == "completed":
+                new_state = "extracted"
+            elif status in ("failed", "cancelled"):
+                new_state = "extract_failed"
+            else:
+                new_state = "extract_unknown"
+            detail = str(task.get("error") or task.get("stage") or "")
+            if new_state != state.commit_state:
+                changed += 1
+                logger.info(
+                    "session %s extraction %s%s",
+                    session_id,
+                    new_state,
+                    f" ({detail[:120]})" if detail else "",
+                )
+            state.commit_state = new_state
+            state.commit_detail = detail
+        return changed
 
     async def flush_all(self):
         """Drain every session, including commits already in flight.
@@ -152,4 +223,7 @@ class CommitScheduler:
             "pending_tokens": state.pending_tokens,
             "last_commit_ts": state.last_commit_ts,
             "committing": state.committing,
+            "commit_state": state.commit_state,
+            "commit_detail": state.commit_detail,
+            "extract_task_id": state.extract_task_id,
         }

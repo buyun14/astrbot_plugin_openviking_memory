@@ -116,6 +116,19 @@
 
 队列深度、已重放数、已丢弃数可在 `/ov_status` 的 `Outbox:` 行看到。
 
+## 可观测性（`/ov_status`）
+
+除了基础状态，`/ov_status` 还会报出这几件原本“黑盒”的事：
+
+| 行 | 含义 |
+|------|------|
+| `Last commit: … [状态, task=…]` | **提交是两阶段的**：归档（Phase 1）在 commit 返回前完成，记忆抽取（Phase 2）在后台跑。状态取值：`archived`（无 task）、`extracting`（已受理，抽取中）、`extracted`（抽取完成）、`extract_failed`（抽取失败，带原因）、`extract_unknown`（任务已过期/丢失）、`commit_failed`（请求就没成功，pending 保留待重试）。因此“提交成功”不再等于“记忆已可检索” |
+| `Recall: … , peer_scope=…, dedup ring=…` | 当前召回档位（context / 降级 / 不可用原因）、生效的 peer 作用域、本会话去重环长度 |
+| `Outbox: N pending …` | 待重放的捕获写入数、已重放数、已丢弃数 |
+| `Context inject: tail (fallbacks=N)` | 注入位置。`tail` = 走 content part（不破坏前缀缓存）；一旦变成 `system_prompt` 就说明回退发生了，prefix cache 命中率会下降，`fallbacks` 为累计次数 |
+
+> 提交状态与任务轮询保存在内存中，进程重启后从空开始（消息本身不会丢——它们在 OV 的 session 里）。
+
 ## 图片转写
 
 把图片内容转成文字入库，两档：

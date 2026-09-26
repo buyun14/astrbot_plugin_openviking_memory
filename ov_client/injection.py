@@ -12,10 +12,23 @@ from __future__ import annotations
 
 from typing import Any
 
+from ._log import logger
+
 try:  # content parts are exposed to plugins by current AstrBot releases
     from astrbot.core.agent.message import TextPart as _TextPart
 except Exception:  # pragma: no cover - very old AstrBot without content parts
     _TextPart = None  # type: ignore[assignment]
+
+# Times we had to inject through the system prompt because content parts were
+# unavailable. Counted rather than swallowed: that path costs prefix-cache hits,
+# so a silent fallback would look exactly like a recall-quality regression.
+_fallback_count = 0
+_fallback_warned = False
+
+
+def injection_fallback_count() -> int:
+    """How often recall had to fall back to rewriting the system prompt."""
+    return _fallback_count
 
 
 def inject_recall_block(
@@ -38,7 +51,17 @@ def inject_recall_block(
 
     if part_cls is None or parts is None:
         # Last-resort fallback for AstrBot versions without content parts. This
-        # costs prefix-cache hits, so it only happens when nothing else exists.
+        # costs prefix-cache hits, so it is counted and reported once instead of
+        # degrading silently.
+        global _fallback_count, _fallback_warned
+        _fallback_count += 1
+        if not _fallback_warned:
+            _fallback_warned = True
+            logger.warning(
+                "[OV] recall injected via system_prompt (no content parts on this "
+                "AstrBot build or request); prefix cache hits will drop. "
+                "Reported once; see the Context inject line of /ov_status."
+            )
         req.system_prompt = (req.system_prompt or "") + "\n\n" + block
         return
 
