@@ -24,6 +24,7 @@ resolves the Bearer identity again at drain time.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import time
 from typing import Any, Awaitable, Callable
@@ -45,6 +46,7 @@ class Outbox:
         *,
         prefix: str = "",
         auth_resolver: Callable[[str], dict] | None = None,
+        on_delivered: Callable[[str, str, dict[str, Any]], Awaitable[None]] | None = None,
         max_pending: int = DEFAULT_MAX_PENDING,
         ttl_seconds: float = DEFAULT_TTL_SECONDS,
     ) -> None:
@@ -53,12 +55,27 @@ class Outbox:
         self._client = client
         self._prefix = prefix
         self._auth_for = auth_resolver or (lambda _venue: {})
+        self._on_delivered = on_delivered
         self._max = max(1, int(max_pending))
         self._ttl = max(0.0, float(ttl_seconds))
         self._queues: dict[str, list[dict[str, Any]]] = {}
         self._loaded = False
         self._sent = 0
         self._dropped = 0
+        # One lock per venue. Capture hooks run concurrently (image transcription
+        # and backfill are background tasks), and both the queue and its persisted
+        # snapshot are read-modify-write state: without this, two overlapping
+        # writes can persist a stale snapshot and drop an entry. It also keeps the
+        # ordering guarantee real, since a later message can only reach OV after
+        # the earlier one is either delivered or queued.
+        self._locks: dict[str, asyncio.Lock] = {}
+
+    def _lock_for(self, venue: str) -> asyncio.Lock:
+        lock = self._locks.get(venue)
+        if lock is None:
+            lock = asyncio.Lock()
+            self._locks[venue] = lock
+        return lock
 
     # -- lifecycle ------------------------------------------------------------
 
@@ -101,28 +118,33 @@ class Outbox:
     ) -> bool:
         """Deliver a capture write, queueing it when that cannot happen now.
 
+        The whole read-decide-write sequence happens under the venue lock, and
+        ``load()`` runs inside it too: that is what makes concurrent callers queue
+        in call order instead of in lock-acquisition order.
+
         Returns:
             True when the message reached OV (or was already queued behind an
             earlier failure), False when the caller must assume it is pending.
         """
-        await self.load()
+        async with self._lock_for(venue):
+            await self.load()
 
-        if self._queues.get(venue):
-            # Never overtake an older undelivered message: the session would read
-            # out of order and the extracted memory would be wrong.
-            await self._enqueue(venue, session_id, message, peer_id)
-            return False
+            if self._queues.get(venue):
+                # Never overtake an older undelivered message: the session would
+                # read out of order and the extracted memory would be wrong.
+                await self._enqueue(venue, session_id, message, peer_id)
+                return False
 
-        ok, retryable, detail = await self._deliver(session_id, message, peer_id, venue)
-        if ok:
-            return True
-        if retryable:
-            logger.warning("[OV] capture write failed, queueing for retry: %s", detail)
-            await self._enqueue(venue, session_id, message, peer_id)
+            ok, retryable, detail = await self._deliver(session_id, message, peer_id, venue)
+            if ok:
+                return True
+            if retryable:
+                logger.warning("[OV] capture write failed, queueing for retry: %s", detail)
+                await self._enqueue(venue, session_id, message, peer_id)
+                return False
+            logger.error("[OV] capture write rejected, dropping: %s", detail)
+            self._dropped += 1
             return False
-        logger.error("[OV] capture write rejected, dropping: %s", detail)
-        self._dropped += 1
-        return False
 
     async def _deliver(
         self,
@@ -168,13 +190,18 @@ class Outbox:
     async def flush(self, venue: str) -> int:
         """Try to deliver a venue's queued messages, oldest first.
 
-        Stops at the first failure so ordering survives across drains.
+        Stops at the first failure so ordering survives across drains. Holds the
+        venue lock, so a replay cannot interleave with a new capture write and a
+        replay cannot be started twice.
         """
-        await self.load()
-        queue = self._queues.get(venue)
-        if not queue:
-            return 0
+        async with self._lock_for(venue):
+            await self.load()
+            queue = self._queues.get(venue)
+            if not queue:
+                return 0
+            return await self._drain_queue(venue, queue)
 
+    async def _drain_queue(self, venue: str, queue: list[dict[str, Any]]) -> int:
         now = time.time()
         delivered = 0
         while queue:
@@ -196,6 +223,7 @@ class Outbox:
                 queue.pop(0)
                 delivered += 1
                 self._sent += 1
+                await self._notify_delivered(venue, session_id, message)
                 continue
             if retryable:
                 logger.debug("[OV] outbox replay still failing for %s: %s", venue, detail)
@@ -208,6 +236,22 @@ class Outbox:
             logger.info("[OV] outbox replayed %d message(s) for %s", delivered, venue)
         await self._write(venue, queue)
         return delivered
+
+    async def _notify_delivered(self, venue: str, session_id: str, message: dict[str, Any]) -> None:
+        """Tell the caller a queued write finally landed.
+
+        Queued messages stay out of the commit counters while they are pending,
+        because counting them would commit a session that is missing messages.
+        Once a replay lands them they have to be counted after all, or a session
+        whose writes all arrived late never reaches a commit threshold and its
+        memories are never extracted.
+        """
+        if self._on_delivered is None:
+            return
+        try:
+            await self._on_delivered(venue, session_id, message)
+        except Exception:
+            logger.exception("[OV] outbox delivery callback failed")
 
     async def flush_all(self) -> int:
         """Drain every venue that has something queued."""
@@ -238,11 +282,13 @@ class Outbox:
     async def _write(self, venue: str, queue: list[dict[str, Any]]) -> None:
         if queue:
             self._queues[venue] = queue
-            await self._kv_put(self._queue_key(venue), json.dumps(queue))
         else:
             self._queues.pop(venue, None)
-            await self._kv_put(self._queue_key(venue), json.dumps([]))
+        # Index before payload: a crash in between then leaves an index entry
+        # whose queue reads back empty, rather than a queue that nothing points
+        # at and load() can never discover.
         await self._persist_index()
+        await self._kv_put(self._queue_key(venue), json.dumps(queue))
 
     async def _persist_index(self) -> None:
         await self._kv_put(self._index_key, json.dumps(sorted(self._queues)))
@@ -250,7 +296,10 @@ class Outbox:
     def _expired(self, entry: dict[str, Any], now: float) -> bool:
         if self._ttl <= 0:
             return False
-        return (now - float(entry.get("ts") or 0.0)) > self._ttl
+        # A corrupt or missing timestamp must not take down load(): a record we
+        # cannot reason about is dropped like an expired one, loudly.
+        ts = _as_float(entry.get("ts"), 0.0)
+        return (now - ts) > self._ttl
 
     # -- diagnostics ----------------------------------------------------------
 
@@ -270,4 +319,11 @@ def _parse_json(raw: Any, default: Any) -> Any:
     try:
         return json.loads(raw)
     except (json.JSONDecodeError, TypeError):
+        return default
+
+
+def _as_float(value: Any, default: float) -> float:
+    try:
+        return float(value)
+    except (TypeError, ValueError):
         return default

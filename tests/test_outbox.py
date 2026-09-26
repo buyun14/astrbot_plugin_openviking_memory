@@ -11,6 +11,7 @@ from __future__ import annotations
 import asyncio
 import json
 import pathlib
+import time
 
 from ov_client.outbox import Outbox
 
@@ -27,10 +28,29 @@ class FakeKv:
         self.store: dict[str, str] = {}
 
     async def get(self, key, default=None):
+        # Yielding keeps the store from being silently atomic for the
+        # concurrency test below.
+        await asyncio.sleep(0)
         return self.store.get(key, default)
 
     async def put(self, key, value):
+        await asyncio.sleep(0)
         self.store[key] = value
+
+
+class RecordingKv(FakeKv):
+    """FakeKv that remembers the order keys were written in."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.writes: list[str] = []
+
+    async def put(self, key, value):
+        self.writes.append(key)
+        await super().put(key, value)
+
+    def wrote_before(self, first: str, second: str) -> bool:
+        return self.writes.index(first) < self.writes.index(second)
 
 
 class FakeOV:
@@ -243,6 +263,96 @@ def test_disabled_outbox_is_not_consulted():
     assert kv.store == {}
 
 
+# -- storage integrity -----------------------------------------------------
+
+
+def test_corrupt_timestamp_does_not_break_loading():
+    """A record we cannot reason about must not take down the whole load."""
+    kv = FakeKv()
+    kv.store["ov_test_outbox_index"] = json.dumps([VENUE])
+    kv.store[f"ov_test_outbox::{VENUE}"] = json.dumps(
+        [
+            {"ts": "not-a-number", "s": SESSION, "m": msg("corrupt")},
+            {"ts": {"nested": True}, "s": SESSION, "m": msg("also corrupt")},
+            {"s": SESSION, "m": msg("no timestamp at all")},
+            {"ts": time.time(), "s": SESSION, "m": msg("good")},
+        ]
+    )
+    box = make_outbox(kv, FakeOV(ok=False))
+
+    async def run():
+        await box.load()  # must not raise
+        return await box.pending(VENUE), box.snapshot()["dropped"]
+
+    pending, dropped = _run(run())
+    assert pending == 1
+    assert dropped == 3
+
+
+def test_index_is_persisted_before_the_queue():
+    """A crash between the two writes must not orphan a queue.
+
+    Index-first degrades to "an index entry whose queue reads back empty";
+    queue-first would leave a full queue that load() can never discover.
+    """
+    kv, client = RecordingKv(), FakeOV(ok=False)
+    box = make_outbox(kv, client)
+
+    _run(box.send(VENUE, SESSION, msg("hi")))
+
+    assert kv.wrote_before("ov_test_outbox_index", f"ov_test_outbox::{VENUE}")
+
+
+def test_concurrent_sends_are_serialised_and_ordered():
+    """Capture hooks run concurrently; the queue must not lose or reorder."""
+    kv, client = FakeKv(), FakeOV(ok=False)
+    box = make_outbox(kv, client)
+
+    async def run():
+        await asyncio.gather(*(box.send(VENUE, SESSION, msg(f"m{i}")) for i in range(5)))
+        stored = json.loads(kv.store[f"ov_test_outbox::{VENUE}"])
+        return await box.pending(VENUE), [e["m"]["content"] for e in stored]
+
+    pending, persisted = _run(run())
+    assert pending == 5
+    assert persisted == ["m0", "m1", "m2", "m3", "m4"]
+
+
+def test_replay_reports_each_delivery():
+    """Replayed writes must be countable, or a drained queue never commits."""
+    kv, client = FakeKv(), FakeOV(ok=False)
+    seen: list[tuple] = []
+
+    async def on_delivered(venue, session_id, message):
+        seen.append((venue, session_id, message.get("content")))
+
+    box = make_outbox(kv, client, on_delivered=on_delivered)
+
+    async def run():
+        await box.send(VENUE, SESSION, msg("late"))
+        client.ok = True
+        return await box.flush(VENUE)
+
+    assert _run(run()) == 1
+    assert seen == [(VENUE, SESSION, "late")]
+
+
+def test_a_failing_delivery_callback_does_not_break_the_drain():
+    kv, client = FakeKv(), FakeOV(ok=False)
+
+    async def boom(*_args):
+        raise RuntimeError("accounting blew up")
+
+    box = make_outbox(kv, client, on_delivered=boom)
+
+    async def run():
+        await box.send(VENUE, SESSION, msg("late"))
+        client.ok = True
+        return await box.flush(VENUE)
+
+    assert _run(run()) == 1
+
+
 # -- wiring guard ----------------------------------------------------------
 
 
@@ -255,3 +365,45 @@ def test_capture_writes_go_through_the_outbox():
         f"found {direct} direct add_message calls; every capture write must go "
         "through self._capture() so failures can be replayed"
     )
+
+
+def test_commit_accounting_only_happens_after_delivery():
+    """record_message must stay behind a delivery check.
+
+    It belongs in exactly two places: _capture_message (gated on the write
+    succeeding) and the replay callback. Anywhere else risks committing a session
+    that is missing messages, or counting a message that was dropped.
+    """
+    source = pathlib.Path(__file__).resolve().parents[1] / "main.py"
+    text = source.read_text(encoding="utf-8")
+    assert text.count("self.scheduler.record_message(") == 2
+
+
+def test_background_loop_is_started_beyond_the_capture_path():
+    """The drainer also polls commit tasks, so it cannot depend on the outbox.
+
+    If it is only started from a capture write, then outbox_enabled=false leaves
+    commit states stuck at "extracting" forever, and a queue restored after a
+    restart is never drained while the bot is idle.
+    """
+    import ast
+
+    source = pathlib.Path(__file__).resolve().parents[1] / "main.py"
+    raw = source.read_text(encoding="utf-8")
+    tree = ast.parse(raw)
+
+    starts = 0
+    loop_source = ""
+    for node in ast.walk(tree):
+        if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            continue
+        body = ast.get_source_segment(raw, node) or ""
+        if node.name == "_drain_loop":
+            loop_source = body
+        if "self._ensure_drainer()" in body and node.name != "_ensure_drainer":
+            starts += 1
+
+    assert starts >= 3, "expected _ensure_drainer() in capture, on_loaded and on_llm_request"
+    assert "poll_commit_tasks" in loop_source
+    # Polling must not sit behind the outbox switch.
+    assert loop_source.index("poll_commit_tasks") < loop_source.index("outbox_enabled")
