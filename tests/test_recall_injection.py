@@ -66,8 +66,6 @@ def test_recall_part_is_not_persisted_in_history():
 
     message = message_mod.Message.model_validate(assembled)
     dumped = message_mod.dump_messages_with_checkpoints([message])[0]
-    persisted = "".join(
-        part["text"] for part in dumped["content"] if part.get("type") == "text"
-    )
+    persisted = "".join(part["text"] for part in dumped["content"] if part.get("type") == "text")
     assert "hello" in persisted
     assert "openviking-context" not in persisted

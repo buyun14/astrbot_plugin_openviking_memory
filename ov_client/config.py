@@ -9,12 +9,11 @@ from the Bearer key, X-OpenViking-* headers are sent only in trusted_mode.
 
 from __future__ import annotations
 
-import logging
 import os
 import re
 from typing import Any
 
-logger = logging.getLogger("astrbot_plugin_openviking_memory")
+from ._log import logger
 
 _DEFAULTS: dict[str, Any] = {
     "ov_base_url": "http://localhost:1933",

@@ -9,16 +9,14 @@ from __future__ import annotations
 
 import asyncio
 import json
-import logging
 import time
 from typing import Any, Awaitable, Callable
 
+from ._log import logger
 from .client import PEER_MEMORY_POLICY, OVClient
 from .config import PluginConfig
 from .identity import derive_session_id, safe_peer_id, venue_is_group
 from .parts import build_message, clean_onebot_text, user_text_part
-
-logger = logging.getLogger("astrbot_plugin_openviking_memory")
 
 STALE_RUNNING_SECONDS = 600
 

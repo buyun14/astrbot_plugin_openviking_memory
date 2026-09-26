@@ -10,13 +10,12 @@ behind a gateway).
 
 from __future__ import annotations
 
-import logging
 from typing import Any
 from urllib.parse import quote
 
 import httpx
 
-logger = logging.getLogger("astrbot_plugin_openviking_memory")
+from ._log import logger
 
 DEFAULT_TIMEOUT = 15.0
 

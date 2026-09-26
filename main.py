@@ -14,13 +14,12 @@ viking://user/<bot>/peers/<sender_id>/.
 from __future__ import annotations
 
 import asyncio
-import logging
 from typing import Any
 
 from astrbot.api import AstrBotConfig
 from astrbot.api.event import AstrMessageEvent, filter
 from astrbot.api.event.filter import EventMessageType, PermissionType
-from astrbot.api.star import Context, Star, register
+from astrbot.api.star import Context, Star
 
 from .ov_client.backfill import BackfillManager
 from .ov_client.client import OVClient
@@ -51,17 +50,12 @@ from .ov_client.presence import PresenceTracker
 from .ov_client.recall import recall_and_format
 
 
-@register(
-    "astrbot_plugin_openviking_memory",
-    "tosaki",
-    "OpenViking Memory Plugin",
-    "0.2.0",
-    "https://github.com/t0saki/astrbot_plugin_openviking_memory",
-)
 class OpenVikingMemoryPlugin(Star):
     def __init__(self, context: Context, config: AstrBotConfig) -> None:
         super().__init__(context)
-        self.logger = logging.getLogger("astrbot")
+        # ``Star.__init__`` already installs this plugin's dedicated logger
+        # (``astrbot.plugin.<plugin_name>``); re-pointing it at the global
+        # "astrbot" logger would defeat the per-plugin log level in the WebUI.
         raw_config = dict(config) if config else {}
         self.cfg = PluginConfig(raw_config)
 
@@ -407,7 +401,8 @@ class OpenVikingMemoryPlugin(Star):
         session_id = derive_session_id(venue_id)
         parts = [assistant_text_part(reply_text)]
         payload = build_message("assistant", parts)
-        await self.ov.add_message(session_id, payload, **auth)
+        if await self.ov.add_message(session_id, payload, **auth):
+            self.scheduler.set_auth(session_id, auth)
         await self.scheduler.record_message(session_id, estimate_tokens(reply_text))
 
     # -- hook: tool I/O capture -----------------------------------------------
@@ -429,7 +424,14 @@ class OpenVikingMemoryPlugin(Star):
         auth = self._auth(venue_id)
         session_id = derive_session_id(venue_id)
         payload = build_message("assistant", [tool_call_part(t_name, tool_args)])
-        await self.ov.add_message(session_id, payload, **auth)
+        if await self.ov.add_message(session_id, payload, **auth):
+            self.scheduler.set_auth(session_id, auth)
+            # Tool traffic is part of the session: it must be counted too, or a
+            # tool-heavy turn never reaches the commit thresholds. It also has to
+            # register auth, since a session can see a tool call before any text.
+            await self.scheduler.record_message(
+                session_id, estimate_tokens(f"{t_name} {tool_args}")
+            )
 
     @filter.on_llm_tool_respond()
     async def on_tool_respond(self, event: AstrMessageEvent, *args, **kwargs):
@@ -447,10 +449,12 @@ class OpenVikingMemoryPlugin(Star):
             return
         auth = self._auth(venue_id)
         session_id = derive_session_id(venue_id)
-        payload = build_message(
-            "assistant", [tool_result_part(t_name, _tool_result_text(tool_result))]
-        )
-        await self.ov.add_message(session_id, payload, **auth)
+        result_text = _tool_result_text(tool_result)
+        payload = build_message("assistant", [tool_result_part(t_name, result_text)])
+        if await self.ov.add_message(session_id, payload, **auth):
+            self.scheduler.set_auth(session_id, auth)
+            # Counted for the same reason as the tool-call part above.
+            await self.scheduler.record_message(session_id, estimate_tokens(result_text))
 
     # -- hook: after message sent → commit eval -------------------------------
 

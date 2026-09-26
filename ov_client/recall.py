@@ -7,6 +7,7 @@ client-side ranking with boosts, token-budgeted injection block.
 
 from __future__ import annotations
 
+import hashlib
 import re
 from typing import Any
 
@@ -53,7 +54,10 @@ _STOPWORDS = {
     "you",
 }
 
-_space_cache: dict[str, str] = {}
+# (api_key fingerprint, user_id) -> OV user space. Bounded: it exists only to
+# avoid re-resolving the same identity on every single recall.
+_SPACE_CACHE_MAX = 64
+_space_cache: dict[tuple[str, str], str] = {}
 
 
 async def _resolve_user_space(
@@ -61,10 +65,15 @@ async def _resolve_user_space(
     api_key: str | None,
     user_id: str | None,
 ) -> str:
-    cache_key = f"{api_key or ''}::{user_id or ''}"
-    if cache_key in _space_cache:
-        return _space_cache[cache_key]
+    # Fingerprint the key rather than using it directly: this dict is long-lived.
+    fingerprint = hashlib.sha256(api_key.encode()).hexdigest()[:16] if api_key else ""
+    cache_key = (fingerprint, user_id or "")
+    cached = _space_cache.get(cache_key)
+    if cached is not None:
+        return cached
     space = await client.resolve_user_space(api_key=api_key, user_id=user_id)
+    if len(_space_cache) >= _SPACE_CACHE_MAX:
+        _space_cache.clear()
     _space_cache[cache_key] = space
     return space
 

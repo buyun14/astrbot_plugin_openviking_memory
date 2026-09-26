@@ -12,16 +12,15 @@ with four complementary triggers:
 from __future__ import annotations
 
 import asyncio
-import logging
 import time
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
 
+from ._log import logger
+
 if TYPE_CHECKING:
     from .client import OVClient
     from .config import PluginConfig
-
-logger = logging.getLogger("astrbot_plugin_openviking_memory")
 
 
 @dataclass
@@ -44,6 +43,9 @@ class CommitScheduler:
         self._auth: dict[str, dict] = {}
         self._memory_policy = PEER_MEMORY_POLICY if cfg.peer_enabled else None
         self._lock = asyncio.Lock()
+        # Commits spawned in the background. Tracked so flush_all() can wait for
+        # them instead of racing with them.
+        self._inflight: set[asyncio.Task] = set()
 
     def set_auth(self, session_id: str, auth: dict):
         self._auth[session_id] = auth
@@ -62,7 +64,13 @@ class CommitScheduler:
         self._reset_idle_timer(session_id, state)
 
         if await self._should_commit(state):
-            asyncio.create_task(self._do_commit(session_id))
+            self._spawn_commit(session_id)
+
+    def _spawn_commit(self, session_id: str) -> None:
+        """Fire a background commit, keeping a handle on it for flush_all()."""
+        task = asyncio.create_task(self._do_commit(session_id))
+        self._inflight.add(task)
+        task.add_done_callback(self._inflight.discard)
 
     async def _should_commit(self, state: SessionState) -> bool:
         if state.committing:
@@ -79,7 +87,7 @@ class CommitScheduler:
         loop = asyncio.get_running_loop()
         state.idle_handle = loop.call_later(
             self._cfg.commit_idle_seconds,
-            lambda: asyncio.create_task(self._do_commit(session_id)),
+            lambda: self._spawn_commit(session_id),
         )
 
     async def evaluate(self, session_id: str):
@@ -115,12 +123,25 @@ class CommitScheduler:
             state.committing = False
 
     async def flush_all(self):
-        tasks = []
-        for session_id, state in list(self._sessions.items()):
+        """Drain every session, including commits already in flight.
+
+        Without waiting for in-flight commits first, a session that is mid-commit
+        would be skipped by ``_do_commit``'s ``committing`` guard and its pending
+        messages would be dropped on shutdown.
+        """
+        for state in self._sessions.values():
             if state.idle_handle is not None:
                 state.idle_handle.cancel()
-            if state.pending_messages > 0:
-                tasks.append(self._do_commit(session_id))
+                state.idle_handle = None
+
+        if self._inflight:
+            await asyncio.gather(*list(self._inflight), return_exceptions=True)
+
+        tasks = [
+            self._do_commit(session_id)
+            for session_id, state in list(self._sessions.items())
+            if state.pending_messages > 0
+        ]
         if tasks:
             await asyncio.gather(*tasks, return_exceptions=True)
 
