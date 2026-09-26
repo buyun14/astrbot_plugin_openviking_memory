@@ -294,6 +294,9 @@ class StubClient:
         self.context_exc = context_exc
         self.hits = None if hits is None else list(hits)
         self.find_items = list(find_items)
+        # Optional per-call script for search_list (supplement tests need two
+        # different answers from the same tier).
+        self.list_queue: list | None = None
         self.calls: list[tuple] = []
 
     async def resolve_user_space(self, api_key=None, user_id=None):
@@ -307,6 +310,8 @@ class StubClient:
 
     async def search_list(self, query, target_uri="", limit=8, **kwargs):
         self.calls.append(("list", kwargs.get("session_id", ""), target_uri))
+        if self.list_queue is not None:
+            return self.list_queue.pop(0) if self.list_queue else []
         return self.hits
 
     async def find(self, query, target_uri="", limit=8, **kwargs):
@@ -325,7 +330,7 @@ def hit(uri: str, abstract: str = "abstract", score: float = 0.9) -> dict:
     return {"uri": uri, "abstract": abstract, "level": 1, "score": score}
 
 
-def recall(client, ledger=None, cfg=None, query="what does alice like", **kw):
+def recall(client, ledger=None, cfg=None, query="what does alice like", self_scope="global", **kw):
     return _run(
         recall_and_format(
             client,
@@ -334,7 +339,7 @@ def recall(client, ledger=None, cfg=None, query="what does alice like", **kw):
             VENUE,
             "astrbot-global",
             session_id=SESSION,
-            self_scope="global",
+            self_scope=self_scope,
             ledger=ledger,
             **kw,
         )
@@ -482,6 +487,93 @@ def test_context_face_can_be_switched_off():
     block = recall(client, None, cfg=cfg)
     assert client.tiers() == ["list"]
     assert block is not None
+
+
+# -- active-peer supplement ------------------------------------------------
+
+
+def peer_uri(peer: str, leaf: str = "preferences/tea") -> str:
+    return f"viking://user/space/peers/{peer}/memories/{leaf}"
+
+
+def self_uri() -> str:
+    return "viking://user/space/memories/self"
+
+
+def context_with_self_note() -> dict:
+    return {"entries": [entry(self_uri(), "self note")], "stats": {}}
+
+
+def test_supplement_is_off_by_default():
+    client = StubClient(context=context_with_self_note(), hits=[hit(peer_uri("bob"))])
+    block = recall(client, make_ledger(FakeKv()), active_member_ids=["bob"])
+
+    assert client.tiers() == ["context"]  # no second search
+    assert "self note" in block
+    assert "preferences/tea" not in block
+
+
+def test_supplement_adds_active_peer_rows():
+    ledger = make_ledger(FakeKv())
+    client = StubClient(context=context_with_self_note())
+    client.list_queue = [[hit(peer_uri("bob"), "Bob prefers tea", 0.8)]]
+
+    block = recall(
+        client,
+        ledger,
+        cfg=PluginConfig({"recall_include_active_peers": True}),
+        active_member_ids=["bob"],
+    )
+
+    assert client.tiers() == ["context", "list"]
+    assert "self note" in block
+    assert "Bob prefers tea" in block
+    assert "about:bob" in block
+    # The extra search is scoped to the peer's own space, not the whole user.
+    assert client.calls[1][2] == [peer_uri("bob").rsplit("/memories", 1)[0] + "/memories"]
+    # Both parts are remembered, so the next turn excludes them.
+    assert sorted(_run(ledger.recent_uris(SESSION))) == sorted([self_uri(), peer_uri("bob")])
+
+
+def test_supplement_skipped_when_context_already_covers_all_peers():
+    client = StubClient(context=context_with_self_note(), hits=[hit(peer_uri("bob"))])
+    recall(
+        client,
+        make_ledger(FakeKv()),
+        cfg=PluginConfig({"recall_include_active_peers": True, "self_scope": "venue"}),
+        self_scope="venue",
+        active_member_ids=["bob"],
+    )
+
+    assert client.tiers() == ["context"]  # peer_scope=all already covers peers
+
+
+def test_supplement_requires_active_member_scope():
+    client = StubClient(context=context_with_self_note(), hits=[hit(peer_uri("bob"))])
+    recall(
+        client,
+        make_ledger(FakeKv()),
+        cfg=PluginConfig({"recall_include_active_peers": True, "peer_recall_scope": "speaker"}),
+        active_member_ids=["bob"],
+    )
+
+    assert client.tiers() == ["context"]
+
+
+def test_supplement_drops_uris_already_in_the_block():
+    duplicate = peer_uri("bob")
+    client = StubClient(context={"entries": [entry(duplicate, "Bob prefers tea")], "stats": {}})
+    client.list_queue = [[hit(duplicate, "Bob prefers tea", 0.99)]]
+
+    block = recall(
+        client,
+        make_ledger(FakeKv()),
+        cfg=PluginConfig({"recall_include_active_peers": True}),
+        active_member_ids=["bob"],
+    )
+
+    assert client.tiers() == ["context", "list"]
+    assert block.count("Bob prefers tea") == 1
 
 
 # -- wiring guard ---------------------------------------------------------

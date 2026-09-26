@@ -63,6 +63,7 @@
 | `recall_query_expansion` | `true` | 允许服务端先扩展 query 再检索（对缩写、单词追问有效，增加延迟） |
 | `recall_rewrite` | `false` | 要服务端生成重写摘要而非原始条目；明显更慢，开启时建议同步调大 `recall_timeout_ms` |
 | `recall_timeout_ms` | `12000` | 召回请求超过此时长就放弃且不注入（毫秒） |
+| `recall_include_active_peers` | `false` | context 档只能看到当前说话人（`peer_scope=actor`）时，额外用一次排序检索补上近期活跃成员的画像 |
 | `commit_message_threshold` | `20` | 累积 N 条消息后自动 commit |
 | `commit_token_threshold` | `4096` | 累积 token 超过此值后自动 commit |
 | `commit_idle_seconds` | `1800` | 空闲 N 秒后自动 commit（也用作 peer 召回的「近期」时间窗） |
@@ -96,6 +97,8 @@
 - **降级档（list / find）**：服务端不提供身份解析，只能像以前那样**逐个显式点名** `target_uri`，点名范围由 `peer_recall_scope` 控制。
 
 这也意味着 `peer_recall_scope` 只影响降级档；context 档看 `recall_peer_scope`。
+
+> `global` 隔离下 `peer_scope` 强制为 `actor`，因此「A 问 Bob 喜欢什么」这类跨人召回会失失。要补回这个能力，把 `recall_include_active_peers` 设为 `true`：插件会在 context 结果之上再发一次**限定在活跃成员自身空间**的排序检索，URI 去重后合并进同一个块。代价是每轮多一次请求；`venue` 隔离下 `peer_scope=all` 已覆盖全部 peer，该项自动跳过。
 
 ## 图片转写
 

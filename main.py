@@ -517,6 +517,11 @@ class OpenVikingMemoryPlugin(Star):
         else:
             recall_status = "context"
         recalled_uris = snap["rings"].get(session_id, 0)
+        supplement = ""
+        if self.cfg.recall_include_active_peers and effective_scope == "actor":
+            supplement = ", active-peer supplement=on"
+        elif self.cfg.recall_include_active_peers:
+            supplement = ", active-peer supplement=redundant (peer_scope=all)"
 
         lines = [
             "OpenViking Memory Plugin v0.2.0",
@@ -530,7 +535,8 @@ class OpenVikingMemoryPlugin(Star):
             f"Pending: {sched['pending_messages']} msgs / ~{sched['pending_tokens']} tokens",
             f"Last commit: {_fmt_ts(sched['last_commit_ts'])}",
             f"Backfill: {bf_status}",
-            f"Recall: {recall_status}, peer_scope={effective_scope}, dedup ring={recalled_uris}",
+            f"Recall: {recall_status}, peer_scope={effective_scope}, "
+            f"dedup ring={recalled_uris}{supplement}",
             f"Active peers: {len(self.presence.active(venue_id))}",
             f"Venues: {len(self._venue_auth)}",
         ]

@@ -56,6 +56,7 @@ All fields are configured via AstrBot WebUI after installation.
 | `recall_query_expansion` | `true` | Let the server expand the query before searching (helps with abbreviations; adds latency) |
 | `recall_rewrite` | `false` | Ask for a rewritten digest instead of raw entries; noticeably slower, so raise `recall_timeout_ms` if enabled |
 | `recall_timeout_ms` | `12000` | Give up on a recall request after this long and inject nothing (ms) |
+| `recall_include_active_peers` | `false` | When the context face can only see the current speaker (`peer_scope=actor`), add one ranked search over the recently-active members' own spaces |
 | `commit_message_threshold` | `20` | Auto-commit after N messages |
 | `commit_token_threshold` | `4096` | Auto-commit when tokens exceed this |
 | `commit_idle_seconds` | `1800` | Auto-commit after N seconds idle (also the "recent" window for peer recall) |
@@ -89,6 +90,8 @@ How the peer set is selected depends on the tier in use:
 - **Degraded tier (list / find)**: no server-side identity resolution, so peers must still be named explicitly as `target_uri`, with `peer_recall_scope` controlling the range.
 
 In other words `peer_recall_scope` only affects the degraded tier; the context tier reads `recall_peer_scope`.
+
+> Under `global` scope `peer_scope` is forced down to `actor`, which costs cross-person recall ("what does Bob like?" asked by A). Set `recall_include_active_peers` to `true` to get it back: the plugin then runs one extra ranked search **scoped to the active members' own spaces** and merges it into the same block after URI dedup. The cost is one extra request per turn; under `venue` scope, where `peer_scope=all` already covers every peer, the supplement is skipped automatically.
 
 ## Image transcription
 

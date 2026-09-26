@@ -37,6 +37,7 @@ _DEFAULTS: dict[str, Any] = {
     "recall_query_expansion": True,
     "recall_rewrite": False,
     "recall_timeout_ms": 12000,
+    "recall_include_active_peers": False,
     "commit_message_threshold": 20,
     "commit_token_threshold": 4096,
     "commit_idle_seconds": 1800,

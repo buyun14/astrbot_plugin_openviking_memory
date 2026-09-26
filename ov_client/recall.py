@@ -11,6 +11,7 @@ import hashlib
 import re
 from typing import Any
 
+from ._log import logger
 from .client import ContextSearchUnsupported, OVClient
 from .config import PluginConfig
 from .identity import parse_venue_origin, safe_peer_id, venue_is_group
@@ -310,11 +311,26 @@ async def recall_and_format(
             client, cfg, text, session_id, self_scope, ledger, exclude, api_key, user_id
         )
         if context is not None:
-            block = _render_context_entries(cfg, context["entries"], venue_id) or _wrap(
-                context["text"]
-            )
+            rows = _context_rows(context["entries"], venue_id)
+            served = _uris_of(context["entries"])
+            if _supplement_enabled(cfg, self_scope, ledger, active_member_ids):
+                extra_rows, extra_uris = await _supplement_rows(
+                    client,
+                    cfg,
+                    text,
+                    venue_id,
+                    session_id,
+                    exclude,
+                    served,
+                    active_member_ids,
+                    api_key,
+                    user_id,
+                )
+                rows.extend(extra_rows)
+                served.extend(extra_uris)
+            block = _assemble_block(rows, cfg.recall_token_budget) or _wrap(context["text"])
             if block:
-                await _remember(ledger, session_id, _uris_of(context["entries"]))
+                await _remember(ledger, session_id, served)
             return block
 
     # -- tier 2 / 3: ranked hits, then client-side ranking -------------------
@@ -423,12 +439,11 @@ def _assemble_block(rows: list[tuple[str, str, str]], budget: int) -> str | None
     return "\n".join(lines)
 
 
-def _render_context_entries(
-    cfg: PluginConfig,
+def _context_rows(
     entries: list[dict[str, Any]],
     venue_id: str,
-) -> str | None:
-    """Render context-face entries.
+) -> list[tuple[str, str, str]]:
+    """Build rows from context-face entries.
 
     These entries differ from ranked hits: their body lives in ``text`` (already
     fetched at whatever detail tier the server chose) and there is no
@@ -436,8 +451,6 @@ def _render_context_entries(
     from an abstract is unavailable here. ``about:<peer>`` still works, since
     the URI is always present.
     """
-    if not entries:
-        return None
     origin_label = parse_venue_origin(venue_id)
     rows: list[tuple[str, str, str]] = []
     for entry in entries:
@@ -445,7 +458,28 @@ def _render_context_entries(
         uri = str(entry.get("uri") or "")
         header = _entry_header(score_pct, origin_label, uri, is_group=False, abstract="")
         rows.append((header, uri, str(entry.get("text") or "")))
-    return _assemble_block(rows, cfg.recall_token_budget)
+    return rows
+
+
+async def _hit_rows(
+    client: OVClient,
+    cfg: PluginConfig,
+    items: list[dict[str, Any]],
+    venue_id: str,
+    api_key: str | None,
+    user_id: str | None = None,
+) -> list[tuple[str, str, str]]:
+    """Build rows from ranked hits, fetching any body they came without."""
+    is_group = venue_is_group(venue_id)
+    origin_label = parse_venue_origin(venue_id)
+    rows: list[tuple[str, str, str]] = []
+    for item in items:
+        score_pct = max(0, min(100, int(item.get("score", 0) * 100)))
+        uri = item.get("uri", "")
+        abstract = (item.get("abstract") or item.get("overview") or "").strip()
+        header = _entry_header(score_pct, origin_label, uri, is_group=is_group, abstract=abstract)
+        rows.append((header, uri, await _resolve_content(client, item, cfg, api_key, user_id)))
+    return rows
 
 
 async def _build_injection_block(
@@ -456,16 +490,100 @@ async def _build_injection_block(
     api_key: str | None,
     user_id: str | None = None,
 ) -> str | None:
-    is_group = venue_is_group(venue_id)
-    origin_label = parse_venue_origin(venue_id)
-    rows: list[tuple[str, str, str]] = []
-    for item in items:
-        score_pct = max(0, min(100, int(item.get("score", 0) * 100)))
-        uri = item.get("uri", "")
-        abstract = (item.get("abstract") or item.get("overview") or "").strip()
-        header = _entry_header(score_pct, origin_label, uri, is_group=is_group, abstract=abstract)
-        rows.append((header, uri, await _resolve_content(client, item, cfg, api_key, user_id)))
+    rows = await _hit_rows(client, cfg, items, venue_id, api_key, user_id)
     return _assemble_block(rows, cfg.recall_token_budget)
+
+
+def _active_peer_targets(space: str, active_member_ids: list[str] | None) -> list[str]:
+    """Memory roots of the recently-active members.
+
+    Only used to supplement the context face, which addresses at most one peer
+    through ``peer_scope`` and therefore cannot reach the other active members.
+    """
+    targets: list[str] = []
+    for member in active_member_ids or []:
+        pid = safe_peer_id(member)
+        if pid:
+            targets.append(f"viking://user/{space}/peers/{pid}/memories")
+    return targets
+
+
+def _supplement_enabled(
+    cfg: PluginConfig,
+    self_scope: str,
+    ledger: RecallLedger | None,
+    active_member_ids: list[str] | None,
+) -> bool:
+    """Whether the active-peer supplement applies to this venue.
+
+    Only when it can add something: the caller asked for active members, there
+    are some, and the context face is limited to a single peer. When
+    ``peer_scope`` is already ``all`` the server has covered those peers.
+    """
+    if not getattr(cfg, "recall_include_active_peers", False):
+        return False
+    if not cfg.peer_enabled or cfg.peer_recall_scope != "speaker_plus_active":
+        return False
+    if not active_member_ids:
+        return False
+    return _resolve_peer_scope(cfg, ledger, self_scope) == "actor"
+
+
+async def _supplement_rows(
+    client: OVClient,
+    cfg: PluginConfig,
+    query: str,
+    venue_id: str,
+    session_id: str,
+    exclude: list[str],
+    already: list[str],
+    active_member_ids: list[str] | None,
+    api_key: str | None,
+    user_id: str | None,
+) -> tuple[list[tuple[str, str, str]], list[str]]:
+    """One extra list-mode search over the active members' own spaces.
+
+    Kept deliberately narrow: it reuses the ranked path so the result set is
+    bounded by ``recall_limit``, and anything already in the block (``already``)
+    or recently served (``exclude``) is dropped so a peer profile cannot be
+    injected twice in one turn.
+    """
+    space = await _resolve_user_space(client, api_key, user_id)
+    targets = _active_peer_targets(space, active_member_ids)
+    if not targets:
+        return [], []
+
+    hits = await client.search_list(
+        query=query,
+        target_uri=targets,
+        limit=max(cfg.recall_limit, 4),
+        min_score=cfg.recall_min_score,
+        session_id=session_id,
+        api_key=api_key,
+        user_id=user_id,
+    )
+    if not hits:
+        return [], []
+
+    blocked = set(exclude) | set(already)
+    profile = _build_query_profile(query)
+    filtered = [
+        hit
+        for hit in hits
+        if hit.get("score", 0) >= cfg.recall_min_score and hit.get("uri") not in blocked
+    ]
+    filtered.sort(key=lambda hit: _rank_item(hit, profile), reverse=True)
+    picked = _dedup(filtered)[: cfg.recall_limit]
+    if not picked:
+        return [], []
+
+    logger.debug(
+        "[OV] active-peer supplement added %d hit(s) from %d peer(s)",
+        len(picked),
+        len(targets),
+    )
+    rows = await _hit_rows(client, cfg, picked, venue_id, api_key, user_id)
+    return rows, _uris_of(picked)
 
 
 async def _resolve_content(

@@ -103,6 +103,11 @@
     "type": "int",
     "default": 12000
   },
+  "recall_include_active_peers": {
+    "description": "Also recall recently-active members' profiles when the context face can only see one peer (adds one extra ranked search per turn)",
+    "type": "bool",
+    "default": false
+  },
   "commit_message_threshold": {
     "description": "Auto-commit after this many pending messages",
     "type": "int",
