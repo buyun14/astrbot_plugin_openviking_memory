@@ -23,7 +23,7 @@ from ov_client.client import (
     OVClient,
 )
 from ov_client.config import PluginConfig
-from ov_client.recall import recall_and_format
+from ov_client.recall import _resolve_peer_scope, recall_and_format
 from ov_client.recall_ledger import RecallLedger
 
 VENUE = "aiocqhttp-group-123"
@@ -297,9 +297,66 @@ def test_peer_scope_never_widens():
     assert ledger.resolve_peer_scope("auto", self_scope="global") == "actor"
     assert ledger.resolve_peer_scope("auto", self_scope="venue") == "all"
 
+    # `all` is a widening request even when asked for explicitly: under global
+    # scope every venue shares one OV user, so it would read other venues'
+    # peers. Only venue scope, where the user *is* the group, may answer `all`.
+    assert ledger.resolve_peer_scope("all", self_scope="global") == "actor"
+    assert ledger.resolve_peer_scope("all", self_scope="venue") == "all"
+    assert ledger.resolve_peer_scope("actor", self_scope="venue") == "actor"
+
     _run(ledger.mark_peer_scope_unsupported("rejected"))
     # Even an explicit `all` must collapse after a refusal.
     assert ledger.resolve_peer_scope("all", self_scope="venue") == "actor"
+
+
+def test_peer_scope_resolution_without_a_ledger_matches_the_ledger():
+    """The ledger-free fallback must apply the same narrowing rule."""
+    cfg = PluginConfig({"recall_peer_scope": "all"})
+    assert _resolve_peer_scope(cfg, None, "global") == "actor"
+    assert _resolve_peer_scope(cfg, None, "venue") == "all"
+
+    actor = PluginConfig({"recall_peer_scope": "actor"})
+    assert _resolve_peer_scope(actor, None, "venue") == "actor"
+    assert _resolve_peer_scope(actor, None, "global") == "actor"
+
+
+def test_explicit_all_is_narrowed_under_global_scope_on_the_wire():
+    """End-to-end: the request body must not carry `all` under global scope."""
+    client = StubClient(context={"entries": [], "stats": {}})
+    recall(client, make_ledger(FakeKv()), cfg=PluginConfig({"recall_peer_scope": "all"}))
+
+    assert client.calls[0][2]["peer_scope"] == "actor"
+
+
+def test_global_scope_falls_back_to_the_active_peer_supplement():
+    """Narrowing to `actor` is what unlocks the documented cross-person path."""
+    client = StubClient(context=context_with_self_note())
+    client.list_queue = [[hit(peer_uri("bob"), "Bob prefers tea", 0.8)]]
+
+    block = recall(
+        client,
+        make_ledger(FakeKv()),
+        cfg=PluginConfig({"recall_peer_scope": "all", "recall_include_active_peers": True}),
+        active_member_ids=["bob"],
+    )
+
+    assert client.tiers() == ["context", "list"]
+    assert "Bob prefers tea" in block
+
+
+def test_corrupt_memo_timestamp_is_treated_as_absent():
+    """A bad `ts` used to raise out of `_memo`.
+
+    The memo is read by the recall path and by /ov_status, so a malformed value
+    arriving from the KV store could break an LLM request.
+    """
+    for ts in ("abc", "2026-01-01", [], {}, 0):
+        kv = FakeKv()
+        kv.store["ov_test_recall_state"] = json.dumps({"context_face": {"ts": ts}})
+        ledger = make_ledger(kv)
+        _run(ledger.load())
+        assert ledger.context_face_ok is True
+        assert ledger.snapshot()["context_face"] == "ok"
 
 
 # -- degradation chain ----------------------------------------------------

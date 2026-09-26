@@ -52,7 +52,7 @@ All fields are configured via AstrBot WebUI after installation.
 | `recall_token_budget` | `2000` | Max tokens for injected context (also sent as the context-mode `max_tokens` budget) |
 | `recall_context_enabled` | `true` | Use server-side context assembly (cross-turn dedup + query expansion + budgeting). Turn off to fall back to plain ranked search |
 | `recall_dedup_turns` | `3` | Do not re-inject a memory served within this many turns (context mode only); use `1` in busy group chats |
-| `recall_peer_scope` | `auto` | Which peers the context face may read: `auto` (`all` under `venue`, `actor` under `global`) / `actor` / `all`. ⚠️ `all` scans every peer of the OV user, so it is only safe when each venue has its own user |
+| `recall_peer_scope` | `auto` | Which peers the context face may read: `auto` (`all` under `venue`, `actor` under `global`) / `actor` / `all`. ⚠️ `all` only takes effect under `venue` isolation: under `global` every venue shares one OV user, so `all` would scan other venues' peers and is always narrowed to `actor` (use `recall_include_active_peers` for cross-person recall) |
 | `recall_query_expansion` | `true` | Let the server expand the query before searching (helps with abbreviations; adds latency) |
 | `recall_rewrite` | `false` | Ask for a rewritten digest instead of raw entries; noticeably slower, so raise `recall_timeout_ms` if enabled |
 | `recall_timeout_ms` | `12000` | Give up on a recall request after this long and inject nothing (ms) |

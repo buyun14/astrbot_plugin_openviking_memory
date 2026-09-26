@@ -78,7 +78,14 @@ class RecallLedger:
         entry = self._state.get(name)
         if not isinstance(entry, dict):
             return None
-        ts = float(entry.get("ts") or 0.0)
+        try:
+            ts = float(entry.get("ts") or 0.0)
+        except (TypeError, ValueError):
+            # A corrupt timestamp cannot say whether the verdict is still
+            # fresh. Treat it as absent so the capability gets retested: that
+            # never keeps a stale narrowing, and the only widening it can cause
+            # is re-asking, which the resolver bounds on its own.
+            return None
         if self._memo_ttl and (time.time() - ts) > self._memo_ttl:
             return None
         return entry
@@ -138,14 +145,21 @@ class RecallLedger:
             self_scope: Effective ``global``/``venue`` scope for this venue.
 
         Returns:
-            ``actor`` or ``all``. ``auto`` maps to ``all`` only when the venue
-            owns its own OV user (venue scope), where ``all`` means "the people
-            in this group" rather than "every peer of a shared user".
+            ``actor`` or ``all``. ``all`` is only ever returned under ``venue``
+            scope, where the venue owns its own OV user and ``all`` means "the
+            people in this group" rather than "every peer of a shared user".
+
+        Under ``global`` scope every venue shares one OV user, so ``all`` would
+        read other venues' peers. It is narrowed to ``actor`` there even when
+        requested explicitly, because that isolation is what the ``global``
+        setting promises. Cross-person recall under global scope comes from
+        ``recall_include_active_peers``, which queries the active members' own
+        spaces instead of widening the peer scope.
         """
         if self.peer_scope_downgraded:
             return "actor"
-        if requested in ("actor", "all"):
-            return requested
+        if requested == "actor":
+            return "actor"
         return "all" if self_scope == "venue" else "actor"
 
     # -- recently served URIs -------------------------------------------------

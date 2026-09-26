@@ -59,7 +59,7 @@
 | `recall_token_budget` | `2000` | 注入上下文的 token 预算（context 档也用它作为服务端 `max_tokens`） |
 | `recall_context_enabled` | `true` | 走服务端 context 组装（跨轮去重 + query 扩展 + 预算）。关闭则退回普通排序检索 |
 | `recall_dedup_turns` | `3` | N 轮内已注入过的记忆不再重复注入（仅 context 档）；群聊可调小到 `1` |
-| `recall_peer_scope` | `auto` | context 档可读哪些 peer：`auto`（`venue` 下为 `all`，`global` 下为 `actor`）/ `actor` / `all`。⚠️ `all` 会扫该 OV user 下所有 peer，仅当每群有独立 user（`venue`）时才安全 |
+| `recall_peer_scope` | `auto` | context 档可读哪些 peer：`auto`（`venue` 下为 `all`，`global` 下为 `actor`）/ `actor` / `all`。⚠️ `all` 只在 `venue` 隔离下生效：`global` 下所有群共用一个 OV user，`all` 会扫到别的群的 peer，因此一律收窄为 `actor`（跨人召回请改用 `recall_include_active_peers`） |
 | `recall_query_expansion` | `true` | 允许服务端先扩展 query 再检索（对缩写、单词追问有效，增加延迟） |
 | `recall_rewrite` | `false` | 要服务端生成重写摘要而非原始条目；明显更慢，开启时建议同步调大 `recall_timeout_ms` |
 | `recall_timeout_ms` | `12000` | 召回请求超过此时长就放弃且不注入（毫秒） |

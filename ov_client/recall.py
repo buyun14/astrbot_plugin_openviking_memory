@@ -177,16 +177,18 @@ def _clean_query(query: str) -> str:
 def _resolve_peer_scope(cfg: PluginConfig, ledger: RecallLedger | None, self_scope: str) -> str:
     """Effective ``actor``/``all`` for this venue.
 
-    ``auto`` widens to ``all`` only under venue scope, where the OV user is the
+    ``all`` is only ever returned under venue scope, where the OV user is the
     group and ``all`` therefore means "the people in this group". Under global
-    scope every peer of the shared bot user would be scanned, so it stays
-    ``actor``.
+    scope every venue shares one OV user, so ``all`` would scan other venues'
+    peers and is narrowed to ``actor`` even when configured explicitly. Kept in
+    step with ``RecallLedger.resolve_peer_scope``, which applies the same rule
+    for callers that have a ledger.
     """
     requested = str(getattr(cfg, "recall_peer_scope", "auto") or "auto").lower()
     if ledger is not None:
         return ledger.resolve_peer_scope(requested, self_scope=self_scope)
-    if requested in ("actor", "all"):
-        return requested
+    if requested == "actor":
+        return "actor"
     return "all" if self_scope == "venue" else "actor"
 
 
