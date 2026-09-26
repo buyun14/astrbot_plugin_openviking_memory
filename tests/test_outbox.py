@@ -367,6 +367,57 @@ def test_capture_writes_go_through_the_outbox():
     )
 
 
+def test_private_method_calls_match_their_signatures():
+    """Call/definition arity must agree.
+
+    _caption_images was called with six arguments while its definition still took
+    seven. Python only complains at runtime, on a path that is off by default, so
+    nothing else catches it: ruff does not, and the test suite does not exercise
+    that path. This guard covers the class instead of the instance.
+    """
+    import ast
+
+    source = pathlib.Path(__file__).resolve().parents[1] / "main.py"
+    tree = ast.parse(source.read_text(encoding="utf-8"))
+
+    bounds: dict[str, tuple[int, int]] = {}
+    for node in ast.walk(tree):
+        if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            continue
+        args = node.args
+        if args.vararg or args.kwarg:
+            continue  # variadic: there is no fixed arity to compare against
+        positional = args.posonlyargs + args.args
+        if positional and positional[0].arg == "self":
+            positional = positional[1:]
+        required = len(positional) - len(args.defaults)
+        required += sum(1 for default in args.kw_defaults if default is None)
+        bounds[node.name] = (required, len(positional) + len(args.kwonlyargs))
+
+    mismatches: list[str] = []
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        func = node.func
+        if not isinstance(func, ast.Attribute) or not isinstance(func.value, ast.Name):
+            continue
+        if func.value.id != "self" or func.attr not in bounds:
+            continue
+        if any(isinstance(arg, ast.Starred) for arg in node.args):
+            continue
+        if any(kw.arg is None for kw in node.keywords):  # **kwargs unpacking
+            continue
+        supplied = len(node.args) + len(node.keywords)
+        low, high = bounds[func.attr]
+        if not low <= supplied <= high:
+            mismatches.append(
+                f"{func.attr} at line {node.lineno}: {supplied} argument(s) "
+                f"for a signature taking {low}..{high}"
+            )
+
+    assert not mismatches, "call/definition arity mismatch: " + "; ".join(mismatches)
+
+
 def test_commit_accounting_only_happens_after_delivery():
     """record_message must stay behind a delivery check.
 

@@ -272,6 +272,25 @@ def test_ledger_memo_expires():
     assert _run(run()) is True
 
 
+def test_ring_size_reads_a_persisted_ring_on_demand():
+    """snapshot() only knows about rings this process has touched.
+
+    Reporting the dedup ring from the snapshot alone shows 0 for a session whose
+    ring is persisted but not yet read, which is what /ov_status used to do.
+    """
+    kv = FakeKv()
+    kv.store[f"ov_test_recall_uris::{SESSION}"] = json.dumps(["viking://a", "viking://b"])
+    ledger = make_ledger(kv)
+
+    async def run():
+        before = ledger.snapshot()["rings"]
+        return before, await ledger.ring_size(SESSION)
+
+    before, size = _run(run())
+    assert before == {}
+    assert size == 2
+
+
 def test_peer_scope_never_widens():
     kv = FakeKv()
     ledger = make_ledger(kv)

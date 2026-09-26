@@ -109,18 +109,6 @@ Captured messages are the one thing this plugin cannot re-derive: the bot's tran
 
 Queue depth, replayed count and dropped count are shown on the `Outbox:` line of `/ov_status`.
 
-## Write durability (outbox)
-
-Captured messages are the one thing this plugin cannot re-derive: the bot's transcript is the only copy, so a lost message is lost for good. Every capture write (text, image transcripts, tool I/O, history backfill) therefore goes through a persisted queue:
-
-- a failed write is stored and retried by a background drainer;
-- **order is preserved**: while a venue's head message is undelivered, later ones do not overtake it — otherwise the session reads out of order and the extracted memory is wrong;
-- only failures that can succeed later are retried (timeouts, 408/425/429/5xx, connection errors). Deterministic 4xx failures are dropped with an error log, since retrying them would block the queue forever;
-- each venue's queue is bounded and entries expire, so a long outage cannot grow the database without limit;
-- **credentials are never stored** — the queue holds only what was said, and the Bearer identity is resolved again at replay time.
-
-Queue depth, replayed count and dropped count are shown on the `Outbox:` line of `/ov_status`.
-
 ## Observability (`/ov_status`)
 
 Beyond the basics, `/ov_status` reports the things that used to be a black box:

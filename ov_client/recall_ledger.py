@@ -182,6 +182,15 @@ class RecallLedger:
     def _ring_key(self, session_id: str) -> str:
         return f"{self._prefix}recall_uris::{session_id}"
 
+    async def ring_size(self, session_id: str) -> int:
+        """How many URIs are currently excluded for this session.
+
+        Reads the ring on demand: ``snapshot()`` only knows about rings this
+        process has already touched, so reporting from it alone shows 0 for a
+        session that has a persisted ring but has not recalled yet.
+        """
+        return len(await self.recent_uris(session_id))
+
     # -- diagnostics ----------------------------------------------------------
 
     def snapshot(self) -> dict[str, Any]:

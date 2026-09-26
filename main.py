@@ -387,7 +387,7 @@ class OpenVikingMemoryPlugin(Star):
             or "请用中文描述这张图片，尽量包含其中的文字内容。"
         )
 
-    async def _caption_images(self, images, venue_id, session_id, auth, peer_id, info, is_group):
+    async def _caption_images(self, images, venue_id, session_id, peer_id, info, is_group):
         provider = self._image_caption_provider()
         if provider is None:
             return
@@ -603,7 +603,7 @@ class OpenVikingMemoryPlugin(Star):
             )
         else:
             recall_status = "context"
-        recalled_uris = snap["rings"].get(session_id, 0)
+        recalled_uris = await self.recall_ledger.ring_size(session_id)
         outbox_snap = self.outbox.snapshot()
         outbox_pending = outbox_snap["venues"].get(venue_id, 0)
         commit_line = f"Last commit: {_fmt_ts(sched['last_commit_ts'])}"

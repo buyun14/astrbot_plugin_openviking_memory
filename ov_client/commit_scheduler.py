@@ -140,6 +140,9 @@ class CommitScheduler:
             else:
                 state.commit_state = "commit_failed"
                 state.commit_detail = "commit request failed"
+                # Drop the previous task handle: polling it would report a state
+                # that belongs to an older commit, overwriting this failure.
+                state.extract_task_id = ""
                 logger.warning(
                     "commit rejected for session %s; pending kept for the next try",
                     session_id,
@@ -147,6 +150,7 @@ class CommitScheduler:
         except Exception as exc:
             state.commit_state = "commit_failed"
             state.commit_detail = f"{type(exc).__name__}"
+            state.extract_task_id = ""
             logger.exception("commit failed for session %s", session_id)
         finally:
             state.committing = False

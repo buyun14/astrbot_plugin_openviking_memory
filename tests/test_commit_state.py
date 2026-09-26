@@ -121,6 +121,61 @@ def test_commit_exception_is_reported_not_swallowed():
     assert state.pending_messages == 25
 
 
+def test_failed_commit_drops_the_previous_extraction_task():
+    """A stale task id would let an old result overwrite the new failure."""
+    client = FakeClient(commit_result={"task_id": "task-old"}, task={"status": "completed"})
+
+    async def run():
+        sched = make_scheduler(client)
+        await commit_once(sched, client)
+        first_task = sched.get_status(SESSION)["extract_task_id"]
+
+        client.commit_result = None  # the next commit is rejected
+        state = sched._get_state(SESSION)
+        state.pending_messages = 25
+        state.pending_tokens = 5000
+        await sched.evaluate(SESSION)
+        status = sched.get_status(SESSION)
+
+        client.task_calls.clear()
+        await sched.poll_commit_tasks()
+        return first_task, status, client.task_calls
+
+    first_task, status, later_calls = _run(run())
+    assert first_task == "task-old"
+    assert status["commit_state"] == "commit_failed"
+    assert status["extract_task_id"] == ""
+    assert later_calls == []
+
+
+def test_commit_exception_also_drops_the_previous_task():
+    class Flaky(FakeClient):
+        def __init__(self):
+            super().__init__(commit_result={"task_id": "task-old"})
+            self.fail = False
+
+        async def commit_session(self, session_id, **kwargs):
+            if self.fail:
+                raise RuntimeError("socket closed")
+            return self.commit_result
+
+    client = Flaky()
+
+    async def run():
+        sched = make_scheduler(client)
+        await commit_once(sched, client)
+        client.fail = True
+        state = sched._get_state(SESSION)
+        state.pending_messages = 25
+        state.pending_tokens = 5000
+        await sched.evaluate(SESSION)
+        return sched.get_status(SESSION)
+
+    status = _run(run())
+    assert status["commit_state"] == "commit_failed"
+    assert status["extract_task_id"] == ""
+
+
 # -- extraction polling ----------------------------------------------------
 
 
