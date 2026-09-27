@@ -102,6 +102,15 @@ def test_unresolved_venue_write_fails_loudly_instead_of_403():
         asyncio.run(c.add_message("sess", {"role": "user", "content": []}))
 
 
+def test_explicit_empty_key_means_no_bearer():
+    # ``_auth`` resolves an unresolved venue to "" on purpose: inheriting the
+    # client-wide key would write under the global self. An explicit "" must
+    # therefore mean "no Bearer", not "use the default".
+    c = _client(USER_KEY)
+    assert "Authorization" not in c._headers(api_key="")
+    assert "Authorization" in c._headers()
+
+
 def test_trusted_mode_may_default_to_the_admin_key():
     c = _client(ADMIN_KEY, trusted_mode=True)
     assert c._headers()["Authorization"] == f"Bearer {ADMIN_KEY}"

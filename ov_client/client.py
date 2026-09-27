@@ -147,7 +147,9 @@ class OVClient:
         api_key: str | None = None,
         user_id: str | None = None,
     ) -> dict[str, str]:
-        key = api_key or self.api_key
+        # ``None`` means "use the client-wide key"; an explicit "" means "no
+        # Bearer" at all, so an unresolved venue never inherits the global key.
+        key = self.api_key if api_key is None else api_key
         if api_key is None and not self.trusted_mode and key.startswith(ADMIN_KEY_PREFIX):
             # Falling back to the client-wide key must never ship an admin key to
             # a tenant data API: OV 403s and the capture write is dropped, which

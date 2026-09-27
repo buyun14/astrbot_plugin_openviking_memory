@@ -182,8 +182,20 @@ class OpenVikingMemoryPlugin(Star):
         return ("", "")
 
     def _auth(self, venue_id: str) -> dict[str, str | None]:
+        """Request auth for a venue.
+
+        A venue whose key could not be resolved must not inherit the client-wide
+        key by accident: in api_key mode that is the *global* user key, so the
+        write would land under the wrong self instead of failing. Resolving it
+        here keeps the decision visible — and lets the client tell "unset"
+        (``None``, use the default) apart from "no Bearer" (``""``).
+        """
         api_key, user_id = self._venue_auth.get(venue_id, ("", ""))
-        return {"api_key": api_key or None, "user_id": user_id or None}
+        if not api_key and self.cfg.trusted_mode:
+            # Trusted mode authenticates with the client-wide key (the admin key
+            # when no user key is set) and asserts identity via the headers.
+            return {"api_key": None, "user_id": user_id or None}
+        return {"api_key": api_key or "", "user_id": user_id or None}
 
     def _extract_event_info(self, event: AstrMessageEvent) -> dict:
         platform = getattr(event, "get_platform_name", lambda: "unknown")()
