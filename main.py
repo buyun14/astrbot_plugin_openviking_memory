@@ -25,7 +25,7 @@ from astrbot.api.star import Context, Star
 from .ov_client.backfill import BackfillManager
 from .ov_client.client import OVClient
 from .ov_client.commit_scheduler import CommitScheduler
-from .ov_client.config import PluginConfig
+from .ov_client.config import PluginConfig, data_api_key, user_api_key
 from .ov_client.identity import (
     derive_ov_user_id,
     derive_session_id,
@@ -63,9 +63,17 @@ class OpenVikingMemoryPlugin(Star):
         self.cfg = PluginConfig(raw_config)
 
         account_id = self.cfg.ov_account_id
-        effective_key = self.cfg.ov_admin_api_key or self.cfg.ov_user_api_key
-        if not account_id and effective_key:
-            account_id = _parse_account_from_key(effective_key)
+        # The client-wide Bearer is the *user* key. An admin/root key is refused
+        # by tenant data APIs ("ROOT API keys cannot access tenant-scoped data
+        # APIs"), so shipping it here turned every capture write into a 403 that
+        # the outbox dropped. The admin key stays a parameter of the admin API
+        # (``_mint_user_key`` → ``OVClient.create_user``). Account resolution
+        # still prefers the admin key, which is the one that carries it.
+        effective_key = data_api_key(self.cfg)
+        if not account_id:
+            account_id = _parse_account_from_key(
+                self.cfg.ov_admin_api_key or effective_key
+            )
 
         self.ov = OVClient(
             base_url=self.cfg.ov_base_url,
@@ -148,8 +156,9 @@ class OpenVikingMemoryPlugin(Star):
         scope = get_effective_self_scope(self.cfg, group_id)
 
         if scope == "global":
-            if self.cfg.ov_user_api_key:
-                self._venue_auth[venue_id] = (self.cfg.ov_user_api_key, "")
+            user_key = user_api_key(self.cfg)
+            if user_key:
+                self._venue_auth[venue_id] = (user_key, "")
                 return
             cache_key = f"{self._kv_prefix}gkey::{self.cfg.global_user_id}"
             key = await self._mint_user_key(self.cfg.global_user_id, cache_key)
@@ -173,8 +182,20 @@ class OpenVikingMemoryPlugin(Star):
         return ("", "")
 
     def _auth(self, venue_id: str) -> dict[str, str | None]:
+        """Request auth for a venue.
+
+        A venue whose key could not be resolved must not inherit the client-wide
+        key by accident: in api_key mode that is the *global* user key, so the
+        write would land under the wrong self instead of failing. Resolving it
+        here keeps the decision visible — and lets the client tell "unset"
+        (``None``, use the default) apart from "no Bearer" (``""``).
+        """
         api_key, user_id = self._venue_auth.get(venue_id, ("", ""))
-        return {"api_key": api_key or None, "user_id": user_id or None}
+        if not api_key and self.cfg.trusted_mode:
+            # Trusted mode authenticates with the client-wide key (the admin key
+            # when no user key is set) and asserts identity via the headers.
+            return {"api_key": None, "user_id": user_id or None}
+        return {"api_key": api_key or "", "user_id": user_id or None}
 
     def _extract_event_info(self, event: AstrMessageEvent) -> dict:
         platform = getattr(event, "get_platform_name", lambda: "unknown")()
@@ -391,6 +412,14 @@ class OpenVikingMemoryPlugin(Star):
         provider = self._image_caption_provider()
         if provider is None:
             return
+        # Runs as a background task, i.e. possibly after the hook that spawned it
+        # returned: it resolves its own auth instead of relying on that ordering.
+        # Resolved after the early return so captions-off installs never pay for
+        # a mint round-trip.
+        ov_user_id = derive_ov_user_id(
+            self.cfg, info["platform"], info["group_id"], info["sender_id"]
+        )
+        await self._ensure_self_auth(venue_id, info["group_id"], ov_user_id)
         prompt = self._image_caption_prompt()
         for comp in images:
             try:
@@ -505,6 +534,15 @@ class OpenVikingMemoryPlugin(Star):
         if not reply_text.strip():
             return
 
+        # This hook captures, so it resolves the venue's Bearer itself:
+        # bot-initiated turns (cron pushes, command replies, spontaneous
+        # messages) reach it for venues no earlier hook has primed, and an
+        # unprimed venue used to fall back to the client-wide key.
+        ov_user_id = derive_ov_user_id(
+            self.cfg, info["platform"], info["group_id"], info["sender_id"]
+        )
+        await self._ensure_self_auth(venue_id, info["group_id"], ov_user_id)
+
         # The bot's own reply is the session owner (self) — no peer_id.
         session_id = derive_session_id(venue_id)
         parts = [assistant_text_part(reply_text)]
@@ -527,6 +565,10 @@ class OpenVikingMemoryPlugin(Star):
         t_name = _tool_name(tool)
         if not t_name:
             return
+        ov_user_id = derive_ov_user_id(
+            self.cfg, info["platform"], info["group_id"], info["sender_id"]
+        )
+        await self._ensure_self_auth(venue_id, info["group_id"], ov_user_id)
         session_id = derive_session_id(venue_id)
         payload = build_message("assistant", [tool_call_part(t_name, tool_args)])
         # Tool traffic is part of the session: it has to be counted too, or a
@@ -547,6 +589,10 @@ class OpenVikingMemoryPlugin(Star):
         t_name = _tool_name(tool)
         if not t_name:
             return
+        ov_user_id = derive_ov_user_id(
+            self.cfg, info["platform"], info["group_id"], info["sender_id"]
+        )
+        await self._ensure_self_auth(venue_id, info["group_id"], ov_user_id)
         session_id = derive_session_id(venue_id)
         result_text = _tool_result_text(tool_result)
         payload = build_message("assistant", [tool_result_part(t_name, result_text)])

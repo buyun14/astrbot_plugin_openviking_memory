@@ -19,6 +19,11 @@ from ._log import logger
 
 DEFAULT_TIMEOUT = 15.0
 
+# Admin ("root") keys are minted with this prefix. They may only be used against
+# the admin API: a tenant data call carrying one is answered with 403
+# PERMISSION_DENIED ("ROOT API keys cannot access tenant-scoped data APIs").
+ADMIN_KEY_PREFIX = "ov_"
+
 # Context-mode search bounds, mirrored from the server's request model so we
 # clamp locally instead of earning a 422.
 CONTEXT_MIN_TOKENS = 64
@@ -141,8 +146,24 @@ class OVClient:
         self,
         api_key: str | None = None,
         user_id: str | None = None,
+        *,
+        allow_admin: bool = False,
     ) -> dict[str, str]:
-        key = api_key or self.api_key
+        # ``None`` means "use the client-wide key"; an explicit "" means "no
+        # Bearer" at all, so an unresolved venue never inherits the global key.
+        key = self.api_key if api_key is None else api_key
+        if not allow_admin and not self.trusted_mode and key.startswith(ADMIN_KEY_PREFIX):
+            # An admin/root key must never reach a tenant data API: OV answers
+            # 403 and the capture write is dropped, which loses the message
+            # quietly. Refuse it whichever way it arrived — through the
+            # client-wide key or configured as ov_user_api_key. trusted_mode is
+            # exempt (its gateway authenticates with the admin key and asserts
+            # identity via the X-OpenViking-* headers), and the admin API opts in
+            # with ``allow_admin``.
+            raise ValueError(
+                "refusing to send an admin key as the Bearer for a tenant data "
+                "API; set ov_user_api_key to a user key or run trusted_mode"
+            )
         h: dict[str, str] = {"Content-Type": "application/json"}
         if key:
             h["Authorization"] = f"Bearer {key}"
@@ -182,7 +203,7 @@ class OVClient:
         try:
             r = await self._http.post(
                 url,
-                headers=self._headers(api_key=admin_api_key),
+                headers=self._headers(api_key=admin_api_key, allow_admin=True),
                 json={"user_id": user_id, "role": "user"},
             )
         except Exception as e:
