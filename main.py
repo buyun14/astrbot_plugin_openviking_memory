@@ -25,7 +25,7 @@ from astrbot.api.star import Context, Star
 from .ov_client.backfill import BackfillManager
 from .ov_client.client import OVClient
 from .ov_client.commit_scheduler import CommitScheduler
-from .ov_client.config import PluginConfig, data_api_key
+from .ov_client.config import PluginConfig, data_api_key, user_api_key
 from .ov_client.identity import (
     derive_ov_user_id,
     derive_session_id,
@@ -156,8 +156,9 @@ class OpenVikingMemoryPlugin(Star):
         scope = get_effective_self_scope(self.cfg, group_id)
 
         if scope == "global":
-            if self.cfg.ov_user_api_key:
-                self._venue_auth[venue_id] = (self.cfg.ov_user_api_key, "")
+            user_key = user_api_key(self.cfg)
+            if user_key:
+                self._venue_auth[venue_id] = (user_key, "")
                 return
             cache_key = f"{self._kv_prefix}gkey::{self.cfg.global_user_id}"
             key = await self._mint_user_key(self.cfg.global_user_id, cache_key)
@@ -396,15 +397,17 @@ class OpenVikingMemoryPlugin(Star):
         )
 
     async def _caption_images(self, images, venue_id, session_id, peer_id, info, is_group):
+        provider = self._image_caption_provider()
+        if provider is None:
+            return
         # Runs as a background task, i.e. possibly after the hook that spawned it
         # returned: it resolves its own auth instead of relying on that ordering.
+        # Resolved after the early return so captions-off installs never pay for
+        # a mint round-trip.
         ov_user_id = derive_ov_user_id(
             self.cfg, info["platform"], info["group_id"], info["sender_id"]
         )
         await self._ensure_self_auth(venue_id, info["group_id"], ov_user_id)
-        provider = self._image_caption_provider()
-        if provider is None:
-            return
         prompt = self._image_caption_prompt()
         for comp in images:
             try:

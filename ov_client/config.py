@@ -186,11 +186,25 @@ class PluginConfig:
         return any(r.search(venue_id) for r in self.bypass_regexes)
 
 
-def data_api_key(cfg: PluginConfig) -> str:
-    """Bearer key for tenant data APIs: the user key, never the admin key.
-
-    OV answers 403 PERMISSION_DENIED for an admin/root Bearer on a tenant-scoped
-    data API (messages / resources / recall), so the admin key may only ever be
-    passed explicitly to the admin API (``OVClient.create_user``).
-    """
+def user_api_key(cfg: PluginConfig) -> str:
+    """The configured *user* key, trimmed. Empty when unset."""
     return str(cfg.ov_user_api_key or "").strip()
+
+
+def data_api_key(cfg: PluginConfig) -> str:
+    """Bearer key for tenant data APIs.
+
+    In api_key mode those APIs (messages / resources / recall) only accept a
+    user key: an admin/root Bearer is answered with 403 PERMISSION_DENIED, so
+    the admin key may only be passed explicitly to the admin API
+    (``OVClient.create_user``). Trusted mode is the exception — there the
+    gateway authenticates with the admin key and asserts identity through
+    ``X-OpenViking-User`` — so the admin key stays the default Bearer.
+    """
+    user_key = user_api_key(cfg)
+    if user_key:
+        return user_key
+    if cfg.trusted_mode:
+        return str(cfg.ov_admin_api_key or "").strip()
+    return ""
+

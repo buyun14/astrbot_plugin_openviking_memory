@@ -148,11 +148,13 @@ class OVClient:
         user_id: str | None = None,
     ) -> dict[str, str]:
         key = api_key or self.api_key
-        if api_key is None and key.startswith(ADMIN_KEY_PREFIX):
+        if api_key is None and not self.trusted_mode and key.startswith(ADMIN_KEY_PREFIX):
             # Falling back to the client-wide key must never ship an admin key to
             # a tenant data API: OV 403s and the capture write is dropped, which
             # loses the message quietly. The config is wrong (an admin key can
             # only be passed explicitly, for ``create_user``) — fail loudly.
+            # trusted_mode is exempt: there the gateway authenticates with the
+            # admin key and asserts identity via the X-OpenViking-* headers.
             raise ValueError(
                 "refusing to send an admin key as the Bearer for a tenant data "
                 "API; set ov_user_api_key or run trusted_mode"

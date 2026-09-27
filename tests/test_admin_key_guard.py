@@ -23,7 +23,7 @@ import pathlib
 import pytest
 
 from ov_client.client import OVClient
-from ov_client.config import PluginConfig, data_api_key
+from ov_client.config import PluginConfig, data_api_key, user_api_key
 
 MAIN_PY = pathlib.Path(__file__).resolve().parent.parent / "main.py"
 
@@ -50,6 +50,25 @@ def test_admin_key_alone_never_becomes_the_data_key():
 
 def test_user_key_is_trimmed():
     cfg = PluginConfig({"ov_user_api_key": f"  {USER_KEY}  "})
+    assert data_api_key(cfg) == USER_KEY
+    assert user_api_key(cfg) == USER_KEY
+
+
+def test_trusted_mode_defaults_to_the_admin_key():
+    # Trusted mode authenticates the gateway with the admin key and asserts
+    # identity through X-OpenViking-User, so the admin key *is* its Bearer.
+    cfg = PluginConfig({"trusted_mode": True, "ov_admin_api_key": ADMIN_KEY})
+    assert data_api_key(cfg) == ADMIN_KEY
+
+
+def test_trusted_mode_still_prefers_a_user_key():
+    cfg = PluginConfig(
+        {
+            "trusted_mode": True,
+            "ov_admin_api_key": ADMIN_KEY,
+            "ov_user_api_key": USER_KEY,
+        }
+    )
     assert data_api_key(cfg) == USER_KEY
 
 
@@ -81,6 +100,17 @@ def test_unresolved_venue_write_fails_loudly_instead_of_403():
     c = _client(ADMIN_KEY)
     with pytest.raises(ValueError):
         asyncio.run(c.add_message("sess", {"role": "user", "content": []}))
+
+
+def test_trusted_mode_may_default_to_the_admin_key():
+    c = _client(ADMIN_KEY, trusted_mode=True)
+    assert c._headers()["Authorization"] == f"Bearer {ADMIN_KEY}"
+
+
+def test_health_probe_is_contained_when_the_default_is_an_admin_key():
+    # health() swallows the misconfiguration into a False rather than raising
+    # inside a probe; the data path is where it has to be loud.
+    assert asyncio.run(_client(ADMIN_KEY).health()) is False
 
 
 def test_user_key_default_and_trusted_mode_still_work():
