@@ -80,11 +80,28 @@ def test_explicit_user_key_is_sent():
     assert c._headers(api_key=USER_KEY)["Authorization"] == f"Bearer {USER_KEY}"
 
 
-def test_explicit_admin_key_is_still_allowed():
-    # ``create_user`` passes the admin key explicitly; only the implicit
-    # client-wide fallback is refused.
+def test_explicit_admin_key_is_refused_on_a_data_call():
+    # The guard must not be bypassable by handing the admin key in explicitly —
+    # e.g. an admin key pasted into ov_user_api_key ends up here through _auth().
     c = _client(USER_KEY)
-    assert c._headers(api_key=ADMIN_KEY)["Authorization"] == f"Bearer {ADMIN_KEY}"
+    with pytest.raises(ValueError, match="admin key"):
+        c._headers(api_key=ADMIN_KEY)
+
+
+def test_admin_key_configured_as_user_key_is_refused():
+    # The scenario the explicit check exists for: the user key setting holds an
+    # admin key, so _auth() resolves it and passes it explicitly.
+    cfg = PluginConfig({"ov_admin_api_key": ADMIN_KEY, "ov_user_api_key": ADMIN_KEY})
+    c = _client(data_api_key(cfg))
+    with pytest.raises(ValueError, match="admin key"):
+        c._headers()
+
+
+def test_admin_api_may_send_the_admin_key():
+    # create_user opts in: the admin key is the admin API's own credential.
+    c = _client(USER_KEY)
+    headers = c._headers(api_key=ADMIN_KEY, allow_admin=True)
+    assert headers["Authorization"] == f"Bearer {ADMIN_KEY}"
 
 
 def test_client_wide_admin_key_is_refused():
