@@ -19,6 +19,11 @@ from ._log import logger
 
 DEFAULT_TIMEOUT = 15.0
 
+# Admin ("root") keys are minted with this prefix. They may only be used against
+# the admin API: a tenant data call carrying one is answered with 403
+# PERMISSION_DENIED ("ROOT API keys cannot access tenant-scoped data APIs").
+ADMIN_KEY_PREFIX = "ov_"
+
 # Context-mode search bounds, mirrored from the server's request model so we
 # clamp locally instead of earning a 422.
 CONTEXT_MIN_TOKENS = 64
@@ -143,6 +148,15 @@ class OVClient:
         user_id: str | None = None,
     ) -> dict[str, str]:
         key = api_key or self.api_key
+        if api_key is None and key.startswith(ADMIN_KEY_PREFIX):
+            # Falling back to the client-wide key must never ship an admin key to
+            # a tenant data API: OV 403s and the capture write is dropped, which
+            # loses the message quietly. The config is wrong (an admin key can
+            # only be passed explicitly, for ``create_user``) — fail loudly.
+            raise ValueError(
+                "refusing to send an admin key as the Bearer for a tenant data "
+                "API; set ov_user_api_key or run trusted_mode"
+            )
         h: dict[str, str] = {"Content-Type": "application/json"}
         if key:
             h["Authorization"] = f"Bearer {key}"

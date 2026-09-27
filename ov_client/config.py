@@ -184,3 +184,13 @@ class PluginConfig:
 
     def is_bypassed(self, venue_id: str) -> bool:
         return any(r.search(venue_id) for r in self.bypass_regexes)
+
+
+def data_api_key(cfg: PluginConfig) -> str:
+    """Bearer key for tenant data APIs: the user key, never the admin key.
+
+    OV answers 403 PERMISSION_DENIED for an admin/root Bearer on a tenant-scoped
+    data API (messages / resources / recall), so the admin key may only ever be
+    passed explicitly to the admin API (``OVClient.create_user``).
+    """
+    return str(cfg.ov_user_api_key or "").strip()

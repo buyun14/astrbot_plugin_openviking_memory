@@ -25,7 +25,7 @@ from astrbot.api.star import Context, Star
 from .ov_client.backfill import BackfillManager
 from .ov_client.client import OVClient
 from .ov_client.commit_scheduler import CommitScheduler
-from .ov_client.config import PluginConfig
+from .ov_client.config import PluginConfig, data_api_key
 from .ov_client.identity import (
     derive_ov_user_id,
     derive_session_id,
@@ -63,9 +63,17 @@ class OpenVikingMemoryPlugin(Star):
         self.cfg = PluginConfig(raw_config)
 
         account_id = self.cfg.ov_account_id
-        effective_key = self.cfg.ov_admin_api_key or self.cfg.ov_user_api_key
-        if not account_id and effective_key:
-            account_id = _parse_account_from_key(effective_key)
+        # The client-wide Bearer is the *user* key. An admin/root key is refused
+        # by tenant data APIs ("ROOT API keys cannot access tenant-scoped data
+        # APIs"), so shipping it here turned every capture write into a 403 that
+        # the outbox dropped. The admin key stays a parameter of the admin API
+        # (``_mint_user_key`` → ``OVClient.create_user``). Account resolution
+        # still prefers the admin key, which is the one that carries it.
+        effective_key = data_api_key(self.cfg)
+        if not account_id:
+            account_id = _parse_account_from_key(
+                self.cfg.ov_admin_api_key or effective_key
+            )
 
         self.ov = OVClient(
             base_url=self.cfg.ov_base_url,
@@ -388,6 +396,12 @@ class OpenVikingMemoryPlugin(Star):
         )
 
     async def _caption_images(self, images, venue_id, session_id, peer_id, info, is_group):
+        # Runs as a background task, i.e. possibly after the hook that spawned it
+        # returned: it resolves its own auth instead of relying on that ordering.
+        ov_user_id = derive_ov_user_id(
+            self.cfg, info["platform"], info["group_id"], info["sender_id"]
+        )
+        await self._ensure_self_auth(venue_id, info["group_id"], ov_user_id)
         provider = self._image_caption_provider()
         if provider is None:
             return
@@ -505,6 +519,15 @@ class OpenVikingMemoryPlugin(Star):
         if not reply_text.strip():
             return
 
+        # This hook captures, so it resolves the venue's Bearer itself:
+        # bot-initiated turns (cron pushes, command replies, spontaneous
+        # messages) reach it for venues no earlier hook has primed, and an
+        # unprimed venue used to fall back to the client-wide key.
+        ov_user_id = derive_ov_user_id(
+            self.cfg, info["platform"], info["group_id"], info["sender_id"]
+        )
+        await self._ensure_self_auth(venue_id, info["group_id"], ov_user_id)
+
         # The bot's own reply is the session owner (self) — no peer_id.
         session_id = derive_session_id(venue_id)
         parts = [assistant_text_part(reply_text)]
@@ -527,6 +550,10 @@ class OpenVikingMemoryPlugin(Star):
         t_name = _tool_name(tool)
         if not t_name:
             return
+        ov_user_id = derive_ov_user_id(
+            self.cfg, info["platform"], info["group_id"], info["sender_id"]
+        )
+        await self._ensure_self_auth(venue_id, info["group_id"], ov_user_id)
         session_id = derive_session_id(venue_id)
         payload = build_message("assistant", [tool_call_part(t_name, tool_args)])
         # Tool traffic is part of the session: it has to be counted too, or a
@@ -547,6 +574,10 @@ class OpenVikingMemoryPlugin(Star):
         t_name = _tool_name(tool)
         if not t_name:
             return
+        ov_user_id = derive_ov_user_id(
+            self.cfg, info["platform"], info["group_id"], info["sender_id"]
+        )
+        await self._ensure_self_auth(venue_id, info["group_id"], ov_user_id)
         session_id = derive_session_id(venue_id)
         result_text = _tool_result_text(tool_result)
         payload = build_message("assistant", [tool_result_part(t_name, result_text)])
