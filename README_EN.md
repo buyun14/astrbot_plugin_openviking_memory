@@ -1,6 +1,8 @@
 # astrbot_plugin_openviking_memory
 
-[中文](README.md) | English
+[中文](README.md) | English | [Changelog](CHANGELOG.md)
+
+> **Community-maintained enhanced branch (v0.3.0)**: Builds on upstream `t0saki/astrbot_plugin_openviking_memory` with a persistent message outbox, tiered recall fallback, tail-injection (protects prefix cache), admin-key guards, and 1,791 lines of test coverage. See [CHANGELOG.md](CHANGELOG.md).
 
 [OpenViking](https://github.com/volcengine/OpenViking) long-term memory integration for [AstrBot](https://github.com/AstrBotDevs/AstrBot).
 
@@ -25,7 +27,7 @@ They are complementary:
 
 ## Installation
 
-1. In AstrBot WebUI, search **OpenViking Memory** in the Plugin Marketplace and install; or install from URL: `https://github.com/t0saki/astrbot_plugin_openviking_memory.git`
+1. In AstrBot WebUI, search **OpenViking Memory** in the Plugin Marketplace and install; or install from URL: `https://github.com/buyun14/astrbot_plugin_openviking_memory.git`
 2. Fill in the plugin configuration (see below).
 3. Reload the plugin.
 

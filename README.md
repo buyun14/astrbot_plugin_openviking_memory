@@ -1,6 +1,8 @@
 # astrbot_plugin_openviking_memory
 
-中文 | [English](README_EN.md)
+中文 | [English](README_EN.md) | [Changelog](CHANGELOG.md)
+
+> **社区维护增强分支（v0.3.0）**：在上游 `t0saki/astrbot_plugin_openviking_memory` 基础上新增消息持久化 outbox（不丢消息）、召回分层降级（context face）、尾部注入（保护 prefix cache）、admin key 守卫与 1791 行测试覆盖。详见 [CHANGELOG.md](CHANGELOG.md)。
 
 为 [AstrBot](https://github.com/AstrBotDevs/AstrBot) 提供 [OpenViking](https://github.com/volcengine/OpenViking) 长期记忆能力。
 
@@ -8,7 +10,7 @@
 
 ## 安装
 
-1. 在 AstrBot WebUI → 插件市场搜索 **OpenViking Memory** 并安装；或从链接安装：`https://github.com/t0saki/astrbot_plugin_openviking_memory.git`
+1. 在 AstrBot WebUI → 插件市场搜索 **OpenViking Memory** 并安装；或从链接安装：`https://github.com/buyun14/astrbot_plugin_openviking_memory.git`
 2. 填写插件配置（见下方）
 3. 重载插件
 
